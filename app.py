@@ -1675,20 +1675,29 @@ def render_output_block(title, highlights, bullets, media, key):
                 f'{len([b for b in bullets if b])} bullets</div><ul>{lis or "<li><i>—</i></li>"}</ul></div>',
                 unsafe_allow_html=True)
 
-    # Every field on its own, because Seller Central has a separate box for each.
-    # st.code gives a native copy button on hover.
+    live = [b for b in bullets if b]
+
+    # One copy box per field, because Seller Central has a separate input for
+    # each. st.code puts its copy icon at the top right of the box, so it sits
+    # above the text it copies.
     st.markdown("##### Copy each field")
-    st.caption("Hover any box and use the copy icon on the right.")
-    st.caption("Title")
+    st.caption("The copy icon is at the top right of every box.")
+
+    st.caption(f"Title — {char_count(title)} chars")
     st.code(title or "", language=None)
-    st.caption("Item Highlights")
+
+    st.caption(f"Item Highlights — {char_count(highlights)} chars")
     st.code(highlights or "", language=None)
-    for i, b in enumerate([b for b in bullets if b], start=1):
-        st.caption(f"Bullet {i}")
+
+    for i, b in enumerate(live, start=1):
+        st.caption(f"Bullet {i} — {char_count(b)} chars")
         st.code(b, language=None)
 
+    st.caption(f"All {len(live)} bullets together — one bullet per line")
+    st.code("\n".join(live), language=None)
+
     export = build_export_text(title, highlights, bullets)
-    with st.expander("Everything in one block"):
+    with st.expander("Title, highlights and bullets in one block"):
         st.code(export, language=None)
     st.download_button("Download listing (.txt)", data=export.encode("utf-8"),
                        file_name="listing.txt", mime="text/plain", key=f"dl_{key}")
@@ -1751,6 +1760,12 @@ tab_enhance, tab_build, tab_keywords, tab_rules = st.tabs(
 # ENHANCE
 # ======================================================================
 with tab_enhance:
+
+    def _clear_enhance():
+        for k in ("e_brand", "e_title", "e_ptype", "e_size", "e_pack", "e_dims", "e_bul", "e_high"):
+            st.session_state[k] = ""
+        st.session_state.pop("_autofill", None)
+        st.session_state.pop("listing", None)
 
     def _autofill_from_title():
         """Runs before the widgets are rebuilt, so it can safely set their values."""
@@ -1837,7 +1852,15 @@ with tab_enhance:
     e_minimal = e_style.startswith("Minimal")
 
     st.markdown("")
-    if st.button("Fix my listing", type="primary", key="e_go", use_container_width=True):
+    go_col, clear_col = st.columns([3, 1])
+    with go_col:
+        _run_enhance = st.button("Fix my listing", type="primary", key="e_go",
+                                 use_container_width=True)
+    with clear_col:
+        st.button("Clear all boxes", key="e_clear", on_click=_clear_enhance,
+                  use_container_width=True)
+
+    if _run_enhance:
         bullets_in, bullet_mode = parse_bullets_smart(e_bul, max_bullets)
         audits = [audit_title(e_title, e_brand, media_mode), audit_highlights(e_high)]
         audits += [audit_bullet(b, i + 1) for i, b in enumerate(bullets_in)]
@@ -1982,7 +2005,22 @@ with tab_build:
     if _fpreview:
         st.caption(f"Detected **{len(_fpreview)}** features.")
 
-    if st.button("Generate listing", type="primary", key="b_go"):
+    def _clear_build():
+        for k in ("b_brand", "b_type", "b_item", "b_size", "b_pack", "b_pk", "b_color",
+                  "b_mat", "b_sk", "b_aud", "b_use", "b_dims", "b_feats"):
+            st.session_state[k] = ""
+        st.session_state.pop("listing", None)
+
+    st.markdown("")
+    gen_col, bclear_col = st.columns([3, 1])
+    with gen_col:
+        _run_build = st.button("Generate listing", type="primary", key="b_go",
+                               use_container_width=True)
+    with bclear_col:
+        st.button("Clear all boxes", key="b_clear", on_click=_clear_build,
+                  use_container_width=True)
+
+    if _run_build:
         if not f_brand.strip() or not f_type.strip():
             st.error("Add a brand name and a product type. The title is built around them.")
         else:
