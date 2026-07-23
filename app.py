@@ -433,6 +433,222 @@ def fix_bullet(text: str) -> str:
     return trim_to(b, BULLET_HARD_LIMIT)[0]
 
 # ----------------------------------------------------------------------
+# Smart title deconstruction
+# ----------------------------------------------------------------------
+# Rather than truncating a legacy title at character 75, the title is parsed
+# into labelled parts (brand, product type, size, pack, colour, material,
+# descriptor phrases) and rebuilt in priority order. Anything that does not fit
+# is demoted to Item Highlights as a WHOLE PHRASE, never as a cut-off fragment.
+
+# Units are ordered longest-first so "fl oz" wins over "oz" and "litre" over "l".
+_UNITS = (r"fl\.?\s?oz|fluid\s?ounces?|ounces?|oz|millilit(?:er|re)s?|ml|"
+          r"lit(?:er|re)s?|ltr|gallons?|gal|quarts?|qt|pints?|pt|"
+          r"kilograms?|kgs?|milligrams?|mg|grams?|gm|pounds?|lbs?|"
+          r"inch(?:es)?|cm|mm|feet|ft|meters?|watts?|volts?|mah|"
+          r"sq\.?\s?ft|g|kg|lb|in|l|w|v|m")
+SIZE_RE = re.compile(r"\b\d+(?:[\.,]\d+)?\s*(?:" + _UNITS + r")\b", re.I)
+PACK_RE = re.compile(
+    r"\b(?:pack\s+of\s+\d+|set\s+of\s+\d+|box\s+of\s+\d+|"
+    r"\d+\s*[-\s]?(?:pack|pk|pcs?|pieces?|count|ct|units?)\b)", re.I)
+
+COLOR_WORDS = {
+    "black", "white", "grey", "gray", "silver", "gold", "rose gold", "blue", "navy",
+    "red", "green", "pink", "purple", "violet", "yellow", "orange", "brown", "beige",
+    "cream", "ivory", "clear", "transparent", "amber", "teal", "maroon", "charcoal",
+    "matte black", "multicolor", "multicolour", "assorted",
+}
+MATERIAL_WORDS = {
+    "glass", "borosilicate", "stainless steel", "steel", "plastic", "silicone",
+    "ceramic", "porcelain", "bamboo", "wood", "wooden", "leather", "cotton",
+    "polyester", "nylon", "aluminium", "aluminum", "copper", "brass", "melamine",
+    "acrylic", "rubber", "tpu", "abs", "pvc", "titanium", "carbon fiber",
+}
+
+# Phrase boundaries in a messy legacy title.
+PHRASE_SPLIT_RE = re.compile(r"\s*(?:[,;|/]|\s[\u2013\u2014-]\s)\s*")
+
+# Many legacy titles carry no punctuation at all, so a comma split leaves one
+# undivided blob. These well-known attribute phrases act as extra split points.
+ATTRIBUTE_PHRASES = [
+    "microwave safe", "dishwasher safe", "freezer safe", "oven safe", "refrigerator safe",
+    "bpa free", "food grade", "lead free", "odor free", "odour free",
+    "leak proof", "leakproof", "spill proof", "spillproof", "air tight", "airtight",
+    "non stick", "nonstick", "non slip", "non-slip", "scratch resistant",
+    "stain resistant", "heat resistant", "shatter proof", "shatterproof",
+    "eco friendly", "easy to clean", "easy clean", "unbreakable", "reusable",
+    "stackable", "space saving", "heavy duty", "long lasting", "quick dry",
+]
+
+
+def is_use_case(phrase: str) -> bool:
+    """Use-case phrases ('for gym', 'cereal or salad') are the first thing to
+    demote, since they describe application rather than product identity."""
+    low = f" {norm(phrase)} "
+    return low.strip().startswith("for ") or " or " in low
+
+
+def _split_unpunctuated(chunk: str) -> list:
+    """Pulls known attribute phrases, materials and colours out of an
+    unpunctuated run, then separates any trailing 'for ...' use-case clause.
+    Longest match wins, so 'stainless steel' is never severed into 'steel'."""
+    rest = chunk
+    extracted = []
+
+    def pull(vocab):
+        nonlocal rest
+        for ph in sorted(vocab, key=len, reverse=True):
+            if len(ph) < 4:
+                continue
+            m = re.search(r"(?i)(?<![a-z0-9])" + re.escape(ph) + r"(?![a-z0-9])", rest)
+            if m:
+                extracted.append(clean_ws(m.group(0)))
+                rest = _remove_phrase(rest, m.group(0))
+
+    pull(ATTRIBUTE_PHRASES)
+    pull(MATERIAL_WORDS)
+    pull(COLOR_WORDS)
+    rest = _tidy_punct(clean_ws(rest))
+
+    tail = ""
+    m = re.search(r"(?i)(?<![a-z0-9])for\s+\S.*$", rest)
+    if m and m.start() > 0:
+        tail = clean_ws(m.group(0))
+        rest = _tidy_punct(clean_ws(rest[:m.start()]))
+
+    return ([rest] if rest else []) + extracted + ([tail] if tail else [])
+
+
+def _remove_phrase(text: str, phrase: str) -> str:
+    if not phrase:
+        return text
+    return re.sub(r"(?i)(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", " ", text)
+
+
+def enforce_brand_first(title: str, brand: str) -> str:
+    """The brand always leads. If it appears mid-title it is moved to the front;
+    if it is missing entirely it is prepended."""
+    brand = clean_ws(brand)
+    title = clean_ws(title)
+    if not brand:
+        return title
+    if norm(title).startswith(norm(brand) + " ") or norm(title) == norm(brand):
+        return title
+    rest = _tidy_punct(_remove_phrase(title, brand))
+    return clean_ws(f"{brand} {rest}") if rest else brand
+
+
+def deconstruct_title(title: str, brand: str = "", product_type: str = "",
+                      size_override: str = "", pack_override: str = "") -> dict:
+    """Parses a legacy title into labelled parts. Explicit size/pack overrides
+    win over whatever is detected in the text."""
+    t = clean_ws(strip_emoji(strip_html(title)))
+
+    # strip banned characters and promo language before parsing
+    if brand and brand in t:
+        head, _s, tail = t.partition(brand)
+        head = "".join(c for c in head if c not in BANNED_TITLE_CHARS)
+        tail = "".join(c for c in tail if c not in BANNED_TITLE_CHARS)
+        t = f"{head}{brand}{tail}"
+    else:
+        t = "".join(c for c in t if c not in BANNED_TITLE_CHARS)
+    t = _tidy_punct(_strip_terms(clean_ws(t), PROMO_TERMS))
+
+    # parentheses are legal but cost characters, so normalise to plain text
+    t = clean_ws(t.replace("(", " ").replace(")", " "))
+
+    pack = clean_ws(pack_override)
+    if not pack:
+        m = PACK_RE.search(t)
+        pack = clean_ws(m.group(0)) if m else ""
+    t = PACK_RE.sub(" ", t)
+
+    size = clean_ws(size_override)
+    found_sizes = [clean_ws(m.group(0)) for m in SIZE_RE.finditer(t)]
+    if not size and found_sizes:
+        size = found_sizes[0]
+    for s in found_sizes:
+        t = _remove_phrase(t, s)
+
+    if brand:
+        t = _remove_phrase(t, brand)
+    ptype = clean_ws(product_type)
+    if ptype:
+        t = _remove_phrase(t, ptype)
+
+    t = _tidy_punct(clean_ws(t))
+
+    # split what remains into whole descriptor phrases
+    descriptors, seen = [], set()
+    for chunk in PHRASE_SPLIT_RE.split(t):
+        chunk = _tidy_punct(clean_ws(chunk))
+        if not chunk:
+            continue
+        pieces = _split_unpunctuated(chunk) if len(chunk) > 22 else [chunk]
+        for piece in pieces:
+            piece = _tidy_punct(clean_ws(piece))
+            key = norm(piece)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            descriptors.append(piece)
+
+    # identity-ish attributes first, use-case phrases last, so use case is the
+    # first thing pushed into Item Highlights when the title runs out of room
+    descriptors.sort(key=is_use_case)
+
+    colors = [d for d in descriptors if norm(d) in COLOR_WORDS]
+    materials = [d for d in descriptors if norm(d) in MATERIAL_WORDS]
+
+    return {"brand": clean_ws(brand), "product_type": ptype, "size": size, "pack": pack,
+            "descriptors": descriptors, "colors": colors, "materials": materials}
+
+
+def smart_title_rebuild(parts: dict, limit: int, minimal: bool = False) -> tuple:
+    """Rebuilds in priority order: brand, product type, descriptors that fit,
+    then the reserved size and pack. Returns (title, demoted_phrases).
+    With minimal=True every descriptor is demoted, leaving brand, type, size, pack."""
+    brand = parts.get("brand", "")
+    ptype = parts.get("product_type", "")
+    size = parts.get("size", "")
+    pack = parts.get("pack", "")
+
+    variant = ", ".join([x for x in [size, pack] if x])
+    if char_count(variant) > limit:
+        variant = trim_to(variant, limit)[0]
+    reserve = char_count(", " + variant) if variant else 0
+    budget = max(0, limit - reserve)
+
+    head = ""
+    for tok in [brand, ptype]:
+        if not tok:
+            continue
+        candidate = clean_ws(f"{head} {tok}") if head else tok
+        if char_count(candidate) <= budget:
+            head = candidate
+
+    demoted = []
+    for d in parts.get("descriptors", []):
+        if norm(d) in norm(head):
+            continue
+        if minimal:
+            demoted.append(d)
+            continue
+        candidate = clean_ws(f"{head} {d}") if head else d
+        # whole phrases only: a descriptor either fits or it is demoted intact
+        if char_count(candidate) <= budget:
+            head = candidate
+        else:
+            demoted.append(d)
+
+    title = clean_ws(f"{head}, {variant}") if (head and variant) else (head or variant)
+    title = enforce_brand_first(title, brand)
+    title, cut = trim_to(title, limit)
+    if cut:
+        demoted.append(cut)
+    return title, demoted
+
+
+# ----------------------------------------------------------------------
 # Builders — size and pack are reserved in the title
 # ----------------------------------------------------------------------
 
@@ -492,6 +708,7 @@ def build_title(f: ProductFacts, media: bool = False) -> str:
     else:
         title = head
 
+    title = enforce_brand_first(title, f.brand)
     return fix_title(title, brand=f.brand, media=media)[0]
 
 
@@ -954,15 +1171,29 @@ with tab_enhance:
     st.caption("One box for all your bullets — paste as many as you have, one per line. "
                "Leading dots, dashes and numbering are stripped automatically.")
 
-    e_brand = st.text_input("Brand name", key="e_brand",
-                            help="Given here so characters inside your brand are not stripped.")
+    eb1, eb2 = st.columns(2)
+    with eb1:
+        e_brand = st.text_input("Brand name", key="e_brand",
+                                help="Always placed first in the rewritten title.")
+    with eb2:
+        e_ptype = st.text_input("Product type", key="e_ptype", placeholder="Bowl, Water Bottle, Mug…",
+                                help="The core noun. Anything else becomes a descriptor that can be "
+                                     "demoted to Item Highlights when space runs out.")
 
     ec1, ec2 = st.columns(2)
     with ec1:
-        e_size = st.text_input("Size", key="e_size", placeholder="32 oz, 8 inch, 500 ml…")
+        e_size = st.text_input("Size", key="e_size", placeholder="500 ML, 32 oz, 8 inch…")
     with ec2:
-        e_pack = st.text_input("Pack / count", key="e_pack", placeholder="Pack of 3, 24 Count…")
-    st.caption("Size and pack are reserved in the rewritten title before anything else is placed.")
+        e_pack = st.text_input("Pack / count", key="e_pack", placeholder="Pack of 2, 24 Count…")
+    st.caption("Leave size and pack blank to auto-detect them from the title. Both are reserved "
+               "before anything else is placed, so they always survive the cap.")
+
+    e_style = st.radio(
+        "Title style", ["Keyword-rich — use the space that is left", "Minimal — brand, type, size, pack only"],
+        index=0, horizontal=True, key="e_style",
+        help="Keyword-rich fills leftover characters with descriptors, dropping use-case phrases "
+             "first. Minimal keeps only product identity and sends every descriptor to Item Highlights.")
+    e_minimal = e_style.startswith("Minimal")
 
     e_title = st.text_area("Current title", height=68, key="e_title")
     st.markdown(counter_pill(char_count(e_title), active_limit), unsafe_allow_html=True)
@@ -991,41 +1222,51 @@ with tab_enhance:
         st.markdown("---")
         st.markdown("##### Corrected rewrite")
 
-        # reserve size / pack, then refit the rest of the original title around them
-        variant = ", ".join([x for x in [clean_ws(e_size), clean_ws(e_pack)] if x])
-        base, overflow = fix_title(e_title, e_brand, media_mode)
-        if variant:
-            stripped = base
-            for bit in [clean_ws(e_size), clean_ws(e_pack)]:
-                if bit:
-                    stripped = re.sub(r"(?i)(?<![a-z0-9])" + re.escape(bit) + r"(?![a-z0-9])", " ", stripped)
-            stripped = _tidy_punct(stripped)
-            budget = max(0, active_limit - char_count(", " + variant))
-            head, cut = trim_to(stripped, budget)
-            fixed_title = clean_ws(f"{head}, {variant}") if head else variant
-            overflow = clean_ws(f"{cut} {overflow}").strip()
-        else:
-            fixed_title = base
+        # --- smart breakdown: parse into parts, then rebuild in priority order ---
+        parts = deconstruct_title(e_title, brand=e_brand, product_type=e_ptype,
+                                  size_override=e_size, pack_override=e_pack)
+        fixed_title, demoted = smart_title_rebuild(parts, active_limit, minimal=e_minimal)
+        fixed_title = fix_title(fixed_title, e_brand, media_mode)[0]
+        fixed_title = enforce_brand_first(fixed_title, e_brand)
 
+        overflow = ", ".join(demoted)
         fixed_high = fix_highlights(e_high, appended=overflow)
         fixed_bullets = [fix_bullet(b) for b in bullets_in][:max_bullets]
 
+        with st.expander("How the old title was broken down", expanded=True):
+            bd1, bd2 = st.columns(2)
+            with bd1:
+                st.markdown(
+                    f"**Kept in the title**\n\n"
+                    f"- Brand: `{parts['brand'] or '—'}`\n"
+                    f"- Product type: `{parts['product_type'] or '(not given)'}`\n"
+                    f"- Size: `{parts['size'] or '—'}`\n"
+                    f"- Pack: `{parts['pack'] or '—'}`")
+            with bd2:
+                if demoted:
+                    st.markdown("**Moved to Item Highlights**\n\n"
+                                + "\n".join(f"- {d}" for d in demoted))
+                else:
+                    st.markdown("**Moved to Item Highlights**\n\nNothing — it all fit.")
+            if not parts["product_type"]:
+                st.info("Add a product type above and the rebuild gets sharper — the tool can then "
+                        "tell the core noun apart from descriptors like a use case.")
+
         if use_ai:
             brief = (f"Rewrite this listing to be fully compliant, keeping its meaning and keywords.\n"
-                     f"Brand: {e_brand}\nSize: {e_size}\nPack: {e_pack}\nTitle: {e_title}\n"
-                     f"Highlights: {e_high}\nBullets: {bullets_in}\n"
-                     f"Target search terms: {', '.join(targets)}")
+                     f"The title MUST start with the brand name and MUST contain the size and pack.\n"
+                     f"Brand: {e_brand}\nProduct type: {e_ptype}\nSize: {parts['size']}\n"
+                     f"Pack: {parts['pack']}\nTitle: {e_title}\nHighlights: {e_high}\n"
+                     f"Bullets: {bullets_in}\nTarget search terms: {', '.join(targets)}")
             data = ai_generate(provider, api_key, model, brief)
             if data:
                 fixed_title = fix_title(data.get("title") or fixed_title, e_brand, media_mode)[0]
+                fixed_title = enforce_brand_first(fixed_title, e_brand)
                 fixed_high = fix_highlights(data.get("highlights") or fixed_high)
                 fixed_bullets = [fix_bullet(b) for b in (data.get("bullets") or fixed_bullets)][:max_bullets]
             elif st.session_state.get("_ai_error"):
                 st.warning(f"AI polish unavailable, showing the rule-based rewrite. "
                            f"({st.session_state['_ai_error']})")
-
-        if overflow:
-            st.caption(f"Moved out of the title and into Item Highlights: “{overflow}”")
 
         render_output_block(fixed_title, fixed_high, fixed_bullets, media_mode, key="enh")
 
