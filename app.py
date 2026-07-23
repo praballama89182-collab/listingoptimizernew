@@ -424,6 +424,11 @@ def fix_title(title: str, brand: str = "", media: bool = False) -> tuple:
         key = re.sub(r"[^a-z0-9]", "", tok.lower())
         if key and key not in STOPWORDS and len(key) > 2:
             if key in seen:
+                # the duplicate may carry the comma that separates the size/pack
+                # tail, so hand any punctuation to the previous surviving token
+                punct = re.sub(r"[A-Za-z0-9]", "", tok)
+                if punct and kept:
+                    kept[-1] = kept[-1] + punct
                 continue
             seen.add(key)
         kept.append(tok)
@@ -973,7 +978,9 @@ def _amazon_once(seed: str, mid: str) -> list:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_suggestions(seed: str, source: str, mid: str, expand: bool) -> tuple:
-    """Returns (suggestions, error_message). Never raises."""
+    """Returns (scored_rows, error_message). Never raises. Each row carries the
+    best autocomplete rank and how many seed expansions surfaced the term, which
+    together form the relevance proxy."""
     seed = clean_ws(seed)
     if not seed:
         return [], "Enter a seed keyword first."
@@ -984,27 +991,31 @@ def fetch_suggestions(seed: str, source: str, mid: str, expand: bool) -> tuple:
 
     fn = (lambda s: _google_once(s)) if source == "Google" else (lambda s: _amazon_once(s, mid))
 
-    results, errors = [], []
+    best_rank, freq, display = {}, {}, {}
+    errors = []
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
             for got in pool.map(lambda s: _safe_call(fn, s, errors), seeds):
-                results.extend(got)
+                for i, term in enumerate(got):
+                    term = clean_ws(term)
+                    if not term:
+                        continue
+                    k = term.lower()
+                    display.setdefault(k, term)
+                    freq[k] = freq.get(k, 0) + 1
+                    best_rank[k] = min(best_rank.get(k, 99), i)
     except Exception as exc:
         return [], f"Could not reach {source}: {exc}"
 
-    seen, out = set(), []
-    for s in results:
-        s = clean_ws(s)
-        k = s.lower()
-        if s and k not in seen:
-            seen.add(k)
-            out.append(s)
-
-    if not out:
+    if not display:
         detail = errors[0] if errors else "no suggestions returned"
         return [], (f"Could not reach {source} ({detail}). Suggestion lookup needs outbound "
                     f"internet access, which some hosts block. Type keywords in manually below.")
-    return out, ""
+
+    rows = [{"term": display[k], "rank": best_rank[k], "freq": freq[k],
+             "score": score_keyword(best_rank[k], freq[k], source)} for k in display]
+    rows.sort(key=lambda r: (-r["score"], r["rank"], r["term"]))
+    return rows, ""
 
 
 def _safe_call(fn, seed, errors: list) -> list:
@@ -1034,6 +1045,211 @@ def keyword_coverage(keywords: list, title: str, highlights: str, bullets: list)
         hit = {name: all(w in toks for w in words) for name, toks in fields.items()}
         rows.append({"keyword": kw, **hit, "anywhere": any(hit.values())})
     return rows
+
+
+# ----------------------------------------------------------------------
+# Backend search terms (Generic Keywords) — 250 BYTES, not characters
+# ----------------------------------------------------------------------
+# Rules applied, per Amazon's 2026 guidance:
+#   • 250 bytes measured in UTF-8. Going over by one byte can de-index the
+#     WHOLE field, so the builder stops short rather than truncating mid-word.
+#   • Single spaces between terms. No commas or punctuation.
+#   • Never repeat a word already in the title, highlights or bullets — those
+#     are indexed already, so repeating them burns bytes for nothing.
+#   • No brand names, no ASINs, no subjective claims, no stop words.
+#   • Skip a plural when the singular is already present, and vice versa.
+
+BACKEND_LIMIT_BYTES = 250
+
+BACKEND_STOPWORDS = STOPWORDS | {
+    "this", "that", "these", "those", "your", "our", "you", "we", "they", "its",
+    "be", "are", "was", "were", "can", "will", "has", "have", "not", "all", "any",
+    "more", "most", "very", "just", "also", "than", "then", "when", "how", "what",
+    "buy", "shop", "sale", "new", "best", "free", "top", "great", "good", "nice",
+    "amazon", "asin", "com",
+    # foreign-language stop words: the content words are worth bytes, these are not
+    "de", "la", "el", "los", "las", "del", "para", "con", "una", "uno", "por", "que",
+    "le", "les", "des", "du", "et", "pour", "avec", "der", "die", "das", "und",
+    "fur", "mit", "ein", "eine", "il", "lo", "di", "da", "per",
+}
+
+ASIN_RE = re.compile(r"^b0[a-z0-9]{8}$", re.I)
+
+
+def byte_len(s: str) -> int:
+    return len((s or "").encode("utf-8"))
+
+
+def norm_kw(s: str) -> str:
+    """Like norm(), but keeps accented and non-Latin letters. Backend keywords in
+    Spanish or German are a real ranking lever, so 'espátula' must not become
+    'esp tula' the way a strict a-z filter would leave it."""
+    s = (s or "").lower()
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return clean_ws(s.replace("_", " "))
+
+
+def build_backend_terms(keywords: list, exclude_text: str = "", brand: str = "",
+                        intent_phrases: bool = False,
+                        limit_bytes: int = BACKEND_LIMIT_BYTES) -> dict:
+    """Returns the refined string plus a breakdown of what was dropped and why."""
+    exclude = set(norm_kw(exclude_text).split()) | set(norm_kw(brand).split())
+
+    kept, seen, dropped_dupe, dropped_visible, dropped_stop = [], set(), [], [], []
+    for kw in keywords:
+        for w in norm_kw(kw).split():
+            if len(w) < 2 or w in BACKEND_STOPWORDS or ASIN_RE.match(w):
+                dropped_stop.append(w)
+                continue
+            if w in exclude:
+                dropped_visible.append(w)
+                continue
+            singular, plural = (w[:-1] if w.endswith("s") else w), (w if w.endswith("s") else w + "s")
+            if w in seen or singular in seen or plural in seen:
+                dropped_dupe.append(w)
+                continue
+            seen.add(w)
+            kept.append(w)
+
+    out = ""
+    overflow = []
+    for w in kept:
+        candidate = f"{out} {w}" if out else w
+        if byte_len(candidate) > limit_bytes:
+            overflow.append(w)
+            continue
+        out = candidate
+
+    phrases_added = []
+    if intent_phrases:
+        for kw in keywords:
+            phrase = norm_kw(kw)
+            if len(phrase.split()) < 3:
+                continue
+            candidate = f"{out} {phrase}" if out else phrase
+            if byte_len(candidate) <= limit_bytes and phrase not in out:
+                out = candidate
+                phrases_added.append(phrase)
+            if len(phrases_added) >= 3:
+                break
+
+    return {"terms": out, "bytes": byte_len(out), "limit": limit_bytes,
+            "kept": len(out.split()) if out else 0,
+            "dropped_visible": sorted(set(dropped_visible)),
+            "dropped_dupe": sorted(set(dropped_dupe)),
+            "dropped_stop": sorted(set(dropped_stop)),
+            "overflow": overflow, "phrases": phrases_added}
+
+
+# ----------------------------------------------------------------------
+# Making selected keywords actually land in the title and bullets
+# ----------------------------------------------------------------------
+
+def _contains_keyword(text: str, kw: str) -> bool:
+    toks = set(norm(text).split())
+    return all(w in toks for w in norm(kw).split() if w)
+
+
+def ensure_keywords_in_title(title: str, keywords: list, brand: str,
+                             limit: int, media: bool = False) -> tuple:
+    """Tries to work each keyword into the title without breaking compliance.
+    Returns (title, already_there, inserted, failed)."""
+    cur = clean_ws(title)
+    already, inserted, failed = [], [], []
+    for kw in keywords:
+        kw = clean_ws(kw)
+        if not kw:
+            continue
+        if _contains_keyword(cur, kw):
+            already.append(kw)
+            continue
+        # insert ahead of the reserved size/pack tail, which sits after the first comma
+        if "," in cur:
+            head, _sep, tail = cur.partition(",")
+            candidate = clean_ws(f"{clean_ws(head)} {kw},{tail}")
+        else:
+            candidate = clean_ws(f"{cur} {kw}")
+        candidate = fix_title(candidate, brand, media)[0]
+        candidate = enforce_brand_first(candidate, brand)
+        if (char_count(candidate) <= limit and not audit_title(candidate, brand, media).errors
+                and _contains_keyword(candidate, kw)):
+            cur = candidate
+            inserted.append(kw)
+        else:
+            failed.append(kw)
+    return cur, already, inserted, failed
+
+
+def ensure_keywords_in_bullets(bullets: list, keywords: list, max_bullets: int) -> tuple:
+    """Adds a bullet for a missing keyword when a slot is free, otherwise appends
+    it to the shortest bullet that has room. Returns (bullets, already, inserted, failed)."""
+    out = [b for b in (bullets or []) if b]
+    already, inserted, failed = [], [], []
+    used_benefits = set()
+    for kw in keywords:
+        kw = clean_ws(kw)
+        if not kw:
+            continue
+        if _contains_keyword(" ".join(out), kw):
+            already.append(kw)
+            continue
+        if len(out) < max_bullets:
+            benefit = _benefit_for(kw, used_benefits)
+            used_benefits.add(benefit)
+            lead = kw.upper() if len(kw) <= 28 else kw[:1].upper() + kw[1:]
+            b = fix_bullet(f"{lead}: {benefit}")
+            if b:
+                out.append(b)
+                inserted.append(kw)
+                continue
+        shortest = sorted(range(len(out)), key=lambda i: len(out[i])) if out else []
+        placed = False
+        for i in shortest:
+            candidate = fix_bullet(f"{out[i]}, {kw}")
+            if char_count(candidate) <= BULLET_SOFT_TARGET and not audit_bullet(candidate, i + 1).errors:
+                out[i] = candidate
+                inserted.append(kw)
+                placed = True
+                break
+        if not placed:
+            failed.append(kw)
+    return out, already, inserted, failed
+
+
+# ----------------------------------------------------------------------
+# Keyword scoring and density
+# ----------------------------------------------------------------------
+# There is no free public source for real Amazon search volume, so this is an
+# explicit PROXY built from autocomplete behaviour: how near the top a term is
+# suggested, and how many different seed expansions surfaced it. Amazon
+# autocomplete is weighted above Google because it reflects buying intent on
+# the marketplace being ranked in.
+
+def score_keyword(rank: int, freq: int, source: str) -> int:
+    rank_pts = max(0, 10 - min(rank, 10)) / 10 * 60
+    freq_pts = min(freq, 5) / 5 * 25
+    src_pts = 15 if source == "Amazon" else 8
+    return int(round(min(100, rank_pts + freq_pts + src_pts)))
+
+
+def priority_band(score: int) -> tuple:
+    """Returns (label, colour, background)."""
+    if score >= 70:
+        return "High", "#0B7A46", "#DCFCE7"
+    if score >= 45:
+        return "Medium", "#96690B", "#FEF3C7"
+    return "Low", "#4B5266", "#EEF1F6"
+
+
+def keyword_density(title: str, highlights: str, bullets: list) -> dict:
+    """Word counts across the visible copy, used to flag stuffing."""
+    words = norm(f"{title} {highlights} {' '.join(bullets or [])}").split()
+    counts = {}
+    for w in words:
+        if len(w) <= 2 or w in BACKEND_STOPWORDS:
+            continue
+        counts[w] = counts.get(w, 0) + 1
+    return counts
 
 # ----------------------------------------------------------------------
 # Optional AI polish
@@ -1221,11 +1437,24 @@ def render_output_block(title, highlights, bullets, media, key):
     st.markdown(f'<div class="outfield"><div class="flabel">About This Item — '
                 f'{len([b for b in bullets if b])} bullets</div><ul>{lis or "<li><i>—</i></li>"}</ul></div>',
                 unsafe_allow_html=True)
+
+    # Every field on its own, because Seller Central has a separate box for each.
+    # st.code gives a native copy button on hover.
+    st.markdown("##### Copy each field")
+    st.caption("Hover any box and use the copy icon on the right.")
+    st.caption("Title")
+    st.code(title or "", language=None)
+    st.caption("Item Highlights")
+    st.code(highlights or "", language=None)
+    for i, b in enumerate([b for b in bullets if b], start=1):
+        st.caption(f"Bullet {i}")
+        st.code(b, language=None)
+
     export = build_export_text(title, highlights, bullets)
+    with st.expander("Everything in one block"):
+        st.code(export, language=None)
     st.download_button("Download listing (.txt)", data=export.encode("utf-8"),
                        file_name="listing.txt", mime="text/plain", key=f"dl_{key}")
-    with st.expander("Copy-paste block"):
-        st.code(export, language="text")
 
 
 def render_coverage(targets, title, highlights, bullets):
@@ -1272,10 +1501,11 @@ with st.sidebar:
         st.caption("AI output is re-checked by the same rule engine before it is shown.")
 
 use_ai = provider != "None — rule-based only" and bool(api_key)
-targets = st.session_state.get("kw_targets", [])
+targets = list(dict.fromkeys(
+    st.session_state.get("kw_sel_title", []) + st.session_state.get("kw_sel_bul", [])))
 if targets:
     st.sidebar.markdown("---")
-    st.sidebar.caption(f"**{len(targets)} target keywords** carried over from Keyword research")
+    st.sidebar.caption(f"**{len(targets)} keywords** selected in Keyword research")
 
 tab_enhance, tab_build, tab_keywords, tab_rules = st.tabs(
     ["Enhance a listing", "Build a listing", "Keyword research", "The 2026 rules"])
@@ -1442,6 +1672,10 @@ with tab_enhance:
         after, _ = health_score(post)
         st.success(f"Health score {before} → {after} out of 100")
 
+        st.session_state["listing"] = {"title": fixed_title, "highlights": fixed_high,
+                                       "bullets": fixed_bullets, "brand": e_brand,
+                                       "source": "Enhance"}
+
         if targets:
             render_coverage(targets, fixed_title, fixed_high, fixed_bullets)
         with st.expander("Audit of the rewrite"):
@@ -1527,6 +1761,10 @@ with tab_build:
                     f"Size and pack in title: “{v}”" if kept
                     else f"Size and pack could not fit in {active_limit} characters. Shorten the brand or product type.")
 
+            st.session_state["listing"] = {"title": title, "highlights": highlights,
+                                           "bullets": bullets, "brand": f_brand,
+                                           "source": "Build"}
+
             if targets:
                 render_coverage(targets, title, highlights, bullets)
             with st.expander("Field-by-field audit"):
@@ -1538,54 +1776,192 @@ with tab_build:
 # KEYWORDS
 # ======================================================================
 with tab_keywords:
-    st.markdown("#### Keyword research")
-    st.caption("Pulls live autocomplete from Google and Amazon. These are real queries people type, "
-               "which makes them a good source of phrasing for Item Highlights and bullets.")
+    st.markdown("### Step 1 — Find keywords")
+    st.caption("Live autocomplete from Google or Amazon. These are phrases people actually type, "
+               "which makes them a good source for the title, bullets and backend terms.")
 
-    k1, k2, k3 = st.columns([2, 1.2, 1])
+    k1, k2, k3 = st.columns([2, 1.1, 1.1])
     with k1:
-        seed = st.text_input("Seed keyword", key="kw_seed", placeholder="insulated water bottle")
+        seed = st.text_input("Seed keyword", key="kw_seed", placeholder="glass cereal bowl")
     with k2:
-        source = st.selectbox("Source", ["Google", "Amazon"], index=0)
+        source = st.selectbox("Source", ["Amazon", "Google"], index=0,
+                              help="Amazon reflects buying intent and is scored higher.")
     with k3:
-        market = st.selectbox("Amazon market", list(AMAZON_MARKETS.keys()), index=0,
+        market = st.selectbox("Marketplace", list(AMAZON_MARKETS.keys()), index=0,
                               disabled=(source != "Amazon"))
-    expand = st.checkbox("Expand A–Z (27 lookups, slower, many more long-tail terms)", value=False)
+    expand = st.checkbox("Expand A–Z for long-tail terms (27 lookups, slower)", value=False)
 
-    if st.button("Fetch suggestions", type="primary", key="kw_go"):
+    if st.button("Fetch keywords", type="primary", key="kw_go"):
         with st.spinner(f"Asking {source}…"):
-            sugg, err = fetch_suggestions(seed, source, AMAZON_MARKETS[market], expand)
-        st.session_state["kw_results"] = sugg
+            rows, err = fetch_suggestions(seed, source, AMAZON_MARKETS[market], expand)
+        st.session_state["kw_rows"] = rows
         st.session_state["kw_error"] = err
+        # widget defaults are ignored once a key exists, so pre-seed the buckets here
+        st.session_state["kw_sel_title"] = [r["term"] for r in rows if r["score"] >= 70][:4]
+        st.session_state["kw_sel_bul"] = [r["term"] for r in rows if 45 <= r["score"] < 70][:6]
+        st.session_state["kw_sel_back"] = [r["term"] for r in rows if r["score"] < 45][:20]
 
     if st.session_state.get("kw_error"):
         st.warning(st.session_state["kw_error"])
-    results = st.session_state.get("kw_results", [])
-    if results:
-        st.success(f"{len(results)} suggestions from {source}.")
-        st.markdown("".join(f'<span class="kwchip">{esc(s)}</span>' for s in results[:120]),
-                    unsafe_allow_html=True)
 
-    st.markdown("##### Target keywords")
-    st.caption("Pick from the results above, or type your own. These get worked into Item Highlights "
-               "and are checked against your finished listing on the other tabs.")
-    picked = st.multiselect("From suggestions", results, default=[], key="kw_pick")
-    manual = st.text_area("Or paste your own, one per line", height=110, key="kw_manual")
-    combined = list(dict.fromkeys(picked + parse_pasted_lines(manual)))
+    rows = st.session_state.get("kw_rows", [])
 
-    cA, cB = st.columns([1, 3])
-    with cA:
-        if st.button("Save targets", key="kw_save"):
-            st.session_state["kw_targets"] = combined
-            st.success(f"{len(combined)} saved.")
-    with cB:
-        if st.session_state.get("kw_targets"):
-            st.markdown("".join(f'<span class="kwchip">{esc(k)}</span>'
-                                for k in st.session_state["kw_targets"]), unsafe_allow_html=True)
+    st.markdown(
+        '<div style="background:#F7F9FC;border:1px solid #E7EAF3;border-radius:12px;'
+        'padding:12px 15px;margin:10px 0;font-size:12.5px;color:#3A4256;">'
+        '<b>Colour key</b> &nbsp;'
+        '<span class="kwchip" style="background:#DCFCE7;color:#0B7A46;border-color:#86EFAC">High</span>'
+        ' suggested near the top and across many searches — put these in the title.&nbsp;'
+        '<span class="kwchip" style="background:#FEF3C7;color:#96690B;border-color:#FCD34D">Medium</span>'
+        ' solid supporting terms — good for bullets.&nbsp;'
+        '<span class="kwchip" style="background:#EEF1F6;color:#4B5266;border-color:#D5DAE5">Low</span>'
+        ' long-tail — send these to backend search terms.'
+        '<br><span style="color:#6B7391">Score is a <b>relevance proxy</b> built from autocomplete '
+        'position and how many searches surfaced the term. It is not real search volume — no free '
+        'source publishes that. For true volume use Brand Analytics or your Search Query '
+        'Performance report.</span></div>',
+        unsafe_allow_html=True)
 
-    st.info("Amazon SEO note: Google autocomplete shows how people phrase things generally, while "
-            "Amazon autocomplete reflects buying intent on the marketplace itself. When the two "
-            "disagree, the Amazon phrasing is usually the one worth ranking for.")
+    if rows:
+        st.success(f"{len(rows)} keywords from {source}, strongest first.")
+        chips = []
+        for r in rows[:100]:
+            label, fg, bg = priority_band(r["score"])
+            chips.append(
+                f'<span class="kwchip" style="background:{bg};color:{fg};border-color:{fg}44">'
+                f'{esc(r["term"])} <b>{r["score"]}</b></span>')
+        st.markdown("".join(chips), unsafe_allow_html=True)
+
+    st.markdown("### Step 2 — Decide where each keyword goes")
+    st.caption("Title keywords get forced into the title. Bullet keywords get forced into the "
+               "bullets. Backend terms are cleaned up and packed into the 250-byte field.")
+
+    previously_picked = (st.session_state.get("kw_sel_title", [])
+                         + st.session_state.get("kw_sel_bul", [])
+                         + st.session_state.get("kw_sel_back", []))
+    all_terms = list(dict.fromkeys(
+        [r["term"] for r in rows]
+        + parse_pasted_lines(st.session_state.get("kw_manual", ""))
+        + previously_picked))
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        sel_title = st.multiselect("Into the title", all_terms, key="kw_sel_title",
+                                   help="Only two or three will fit inside 75 characters.")
+    with a2:
+        sel_bul = st.multiselect("Into the bullets", all_terms, key="kw_sel_bul")
+    with a3:
+        sel_back = st.multiselect("Into backend search terms", all_terms, key="kw_sel_back")
+
+    st.text_area("Add your own keywords, one per line", height=90, key="kw_manual")
+
+    if sel_title or sel_bul or sel_back:
+        with st.expander("Copy the keyword lists"):
+            for lbl, lst in [("Title keywords", sel_title), ("Bullet keywords", sel_bul),
+                             ("Backend keywords", sel_back)]:
+                st.caption(lbl)
+                st.code(", ".join(lst) or "", language=None)
+
+    intent_phrases = st.checkbox(
+        "Add up to 3 intent phrases to the backend field", value=False,
+        help="Amazon\'s AI-assisted search favours context phrases like \'hiking rain jacket wet "
+             "weather\' alongside single words. Costs bytes, so it is off by default.")
+
+    listing = st.session_state.get("listing")
+    st.markdown("### Step 3 — Apply them to your listing")
+
+    if not listing:
+        st.info("Run **Enhance a listing** or **Build a listing** first. The result lands here "
+                "automatically and this step rewrites it around the keywords you picked.")
+    else:
+        st.caption(f"Working on the listing from the **{listing['source']}** tab.")
+        if st.button("Apply keywords and rebuild", type="primary", key="kw_apply",
+                     use_container_width=True):
+            brand = listing.get("brand", "")
+
+            new_title, t_already, t_ins, t_fail = ensure_keywords_in_title(
+                listing["title"], sel_title, brand, active_limit, media_mode)
+            new_bullets, b_already, b_ins, b_fail = ensure_keywords_in_bullets(
+                listing["bullets"], sel_bul, max_bullets)
+
+            visible = f"{new_title} {listing['highlights']} {' '.join(new_bullets)}"
+            back = build_backend_terms(sel_back, exclude_text=visible, brand=brand,
+                                       intent_phrases=intent_phrases)
+
+            st.markdown("##### Refreshed listing")
+            render_output_block(new_title, listing["highlights"], new_bullets, media_mode, key="kw")
+
+            bcls = "c-bad" if back["bytes"] > back["limit"] else "c-ok"
+            st.markdown(
+                f'<div class="outfield"><div class="flabel">Backend search terms &nbsp;'
+                f'<span class="counter {bcls}">{back["bytes"]}/{back["limit"]} bytes</span></div>'
+                f'<div class="fval" style="font-family:JetBrains Mono,monospace;font-size:13px">'
+                f'{esc(back["terms"]) or "<i>nothing left to add</i>"}</div></div>',
+                unsafe_allow_html=True)
+            st.caption("Copy the backend search terms")
+            st.code(back["terms"] or "", language=None)
+            st.download_button(
+                "Download backend terms (.txt)", data=back["terms"].encode("utf-8"),
+                file_name="backend_search_terms.txt", mime="text/plain", key="dl_back")
+
+            r1, r2 = st.columns(2)
+            with r1:
+                st.markdown("**Title**")
+                if t_already:
+                    st.markdown(" ".join(f'<span class="kwchip kwhit">{esc(k)} already there</span>'
+                                         for k in t_already), unsafe_allow_html=True)
+                if t_ins:
+                    st.markdown(" ".join(f'<span class="kwchip kwhit">{esc(k)} added</span>'
+                                         for k in t_ins), unsafe_allow_html=True)
+                if t_fail:
+                    st.markdown(" ".join(f'<span class="kwchip kwmiss">{esc(k)} would not fit</span>'
+                                         for k in t_fail), unsafe_allow_html=True)
+                    st.caption("No room inside 75 characters. Drop one, shorten the product type, "
+                               "or move these to backend terms.")
+            with r2:
+                st.markdown("**Bullets**")
+                if b_already:
+                    st.markdown(" ".join(f'<span class="kwchip kwhit">{esc(k)} already there</span>'
+                                         for k in b_already), unsafe_allow_html=True)
+                if b_ins:
+                    st.markdown(" ".join(f'<span class="kwchip kwhit">{esc(k)} added</span>'
+                                         for k in b_ins), unsafe_allow_html=True)
+                if b_fail:
+                    st.markdown(" ".join(f'<span class="kwchip kwmiss">{esc(k)} did not fit</span>'
+                                         for k in b_fail), unsafe_allow_html=True)
+
+            with st.expander("What the backend cleanup removed, and why"):
+                st.markdown(
+                    f"- **Already in your visible copy** ({len(back['dropped_visible'])}): "
+                    f"`{', '.join(back['dropped_visible'][:25]) or 'none'}`  \n"
+                    f"  Amazon already indexes your title, highlights and bullets, so repeating "
+                    f"these would waste bytes.\n"
+                    f"- **Duplicates or plural forms** ({len(back['dropped_dupe'])}): "
+                    f"`{', '.join(back['dropped_dupe'][:25]) or 'none'}`\n"
+                    f"- **Stop words, brand and filler** ({len(back['dropped_stop'])}): "
+                    f"`{', '.join(back['dropped_stop'][:25]) or 'none'}`\n"
+                    f"- **Did not fit in 250 bytes** ({len(back['overflow'])}): "
+                    f"`{', '.join(back['overflow'][:25]) or 'none'}`")
+                if back["phrases"]:
+                    st.markdown("- **Intent phrases kept**: `" + "`, `".join(back["phrases"]) + "`")
+                st.caption("Terms are single words separated by single spaces, with no commas. "
+                           "Word order does not matter to Amazon, and going one byte over 250 can "
+                           "de-index the entire field, so the builder stops short rather than trimming "
+                           "mid-word.")
+
+            density = keyword_density(new_title, listing["highlights"], new_bullets)
+            over = sorted([(w, c) for w, c in density.items() if c >= 4],
+                          key=lambda x: -x[1])[:10]
+            if over:
+                st.warning("Repeated a lot in the visible copy, which reads as stuffing: "
+                           + ", ".join(f"{w} ×{c}" for w, c in over))
+            else:
+                st.success("No word is over-repeated in the visible copy.")
+
+            audits = [audit_title(new_title, brand, media_mode), audit_highlights(listing["highlights"])]
+            audits += [audit_bullet(b, i + 1) for i, b in enumerate(new_bullets)]
+            render_scorecard(audits)
+            st.session_state["listing"] = {**listing, "title": new_title, "bullets": new_bullets}
 
 # ======================================================================
 # RULES
