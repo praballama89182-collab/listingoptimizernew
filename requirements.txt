@@ -1,0 +1,7 @@
+streamlit>=1.36
+
+# Optional — only needed if you turn on "AI polish" in the sidebar.
+# The app imports these lazily and falls back to the rule-based engine
+# if they're absent, so you can leave them commented out.
+# anthropic>=0.39
+# openai>=1.40
