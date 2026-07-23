@@ -113,6 +113,20 @@ BENEFIT_HINTS = {
     "battery": "runs long enough to get through a full day of use",
     "washable": "goes in the wash and comes out ready for the next round",
     "adjust": "dials in to your preferred fit or setting",
+    "microwave safe": "goes straight from fridge to microwave without changing dishes",
+    "dishwasher safe": "goes on the top rack instead of being washed by hand",
+    "freezer safe": "handles the freezer without cracking or warping",
+    "oven safe": "moves from prep straight into the oven",
+    "food grade": "meets food-contact standards for everyday eating and drinking",
+    "airtight": "keeps air out so contents stay fresh for longer",
+    "air tight": "keeps air out so contents stay fresh for longer",
+    "stackable": "stacks together so it takes up less cupboard space",
+    "heavy duty": "takes daily loads without flexing or cracking",
+    "unbreakable": "survives the drops that end most alternatives",
+    "glass": "will not stain or hold onto smells the way plastic does",
+    "borosilicate": "handles sudden temperature changes without cracking",
+    "ceramic": "heats evenly and wipes clean without staining",
+    "toughened": "stands up to knocks that would chip ordinary material",
 }
 
 GENERIC_BENEFITS = [
@@ -450,6 +464,53 @@ SIZE_RE = re.compile(r"\b\d+(?:[\.,]\d+)?\s*(?:" + _UNITS + r")\b", re.I)
 PACK_RE = re.compile(
     r"\b(?:pack\s+of\s+\d+|set\s+of\s+\d+|box\s+of\s+\d+|"
     r"\d+\s*[-\s]?(?:pack|pk|pcs?|pieces?|count|ct|units?)\b)", re.I)
+# 12 x 8 x 4 inches / 10 × 5 cm — matched before plain sizes so it is not split.
+DIMENSION_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:x|\u00D7|\*)\s*\d+(?:\.\d+)?"
+    r"(?:\s*(?:x|\u00D7|\*)\s*\d+(?:\.\d+)?)?"
+    r"\s*(?:cm|mm|inch(?:es)?|in|ft|feet|m)?\b", re.I)
+
+# Common Amazon product-type nouns, longest match wins. Used to pull the core
+# noun out of a pasted title so the rebuild knows identity from description.
+PRODUCT_TYPE_LEXICON = [
+    "stainless steel water bottle", "insulated water bottle", "water bottle", "coffee mug",
+    "travel mug", "mixing bowl", "serving bowl", "salad bowl", "cereal bowl", "soup bowl",
+    "storage container", "lunch box", "tiffin box", "french press", "cutting board",
+    "frying pan", "pressure cooker", "dinner set", "bed sheet", "yoga mat", "yoga block",
+    "running shoes", "hiking boots", "laptop stand", "phone case", "power bank",
+    "smart watch", "air fryer", "vacuum cleaner", "hand blender", "water purifier",
+    "room heater", "table lamp", "wall clock", "photo frame", "door mat", "pillow cover",
+    "towel set", "shoe rack", "spice rack", "trash can", "dish rack", "ice tray",
+    "protein powder", "face wash", "hair oil", "essential oil", "body lotion",
+    "colloidal silver", "mineral supplement", "dietary supplement",
+    "headphones", "earphones", "earbuds", "speaker", "charger", "keyboard", "monitor",
+    "backpack", "wallet", "handbag", "sandals", "sneakers", "t shirt", "tshirt",
+    "bowl", "bottle", "mug", "cup", "plate", "tumbler", "jar", "container", "box",
+    "pan", "pot", "kettle", "knife", "spoon", "fork", "tray", "basket", "rack",
+    "shoes", "shirt", "pants", "jacket", "socks", "bag", "belt", "watch", "cable",
+    "mouse", "lamp", "chair", "table", "desk", "mat", "rug", "pillow", "blanket",
+    "towel", "brush", "comb", "shampoo", "soap", "cream", "serum", "oil", "capsules",
+    "tablets", "powder", "supplement", "toy", "puzzle", "pen", "notebook", "marker",
+]
+
+
+def detect_product_type(text: str) -> tuple:
+    """Returns (product_type, confidence). Tries a known-noun lexicon first,
+    then falls back to the trailing words of whatever description is left."""
+    t = clean_ws(text)
+    if not t:
+        return "", "none"
+    low = norm(t)
+    for noun in sorted(PRODUCT_TYPE_LEXICON, key=len, reverse=True):
+        if re.search(r"(?<![a-z0-9])" + re.escape(noun) + r"(?![a-z0-9])", low):
+            # give it back in the casing used in the original title
+            m = re.search(r"(?i)(?<![a-z0-9])" + re.escape(noun) + r"(?![a-z0-9])", t)
+            return (clean_ws(m.group(0)) if m else noun.title()), "known"
+    words = [w for w in t.split() if w]
+    if not words:
+        return "", "none"
+    guess = " ".join(words[-2:]) if len(words) >= 2 else words[-1]
+    return clean_ws(guess), "guess"
 
 COLOR_WORDS = {
     "black", "white", "grey", "gray", "silver", "gold", "rose gold", "blue", "navy",
@@ -538,9 +599,10 @@ def enforce_brand_first(title: str, brand: str) -> str:
 
 
 def deconstruct_title(title: str, brand: str = "", product_type: str = "",
-                      size_override: str = "", pack_override: str = "") -> dict:
-    """Parses a legacy title into labelled parts. Explicit size/pack overrides
-    win over whatever is detected in the text."""
+                      size_override: str = "", pack_override: str = "",
+                      dimensions_override: str = "") -> dict:
+    """Parses a legacy title into labelled parts. Explicit overrides win over
+    whatever is detected in the text."""
     t = clean_ws(strip_emoji(strip_html(title)))
 
     # strip banned characters and promo language before parsing
@@ -562,6 +624,14 @@ def deconstruct_title(title: str, brand: str = "", product_type: str = "",
         pack = clean_ws(m.group(0)) if m else ""
     t = PACK_RE.sub(" ", t)
 
+    # dimensions before size, so "12 x 8 inch" is not mistaken for "8 inch"
+    dims = clean_ws(dimensions_override)
+    found_dims = [clean_ws(m.group(0)) for m in DIMENSION_RE.finditer(t)]
+    if not dims and found_dims:
+        dims = found_dims[0]
+    for d in found_dims:
+        t = _remove_phrase(t, d)
+
     size = clean_ws(size_override)
     found_sizes = [clean_ws(m.group(0)) for m in SIZE_RE.finditer(t)]
     if not size and found_sizes:
@@ -571,7 +641,11 @@ def deconstruct_title(title: str, brand: str = "", product_type: str = "",
 
     if brand:
         t = _remove_phrase(t, brand)
+
     ptype = clean_ws(product_type)
+    ptype_conf = "given" if ptype else "none"
+    if not ptype:
+        ptype, ptype_conf = detect_product_type(t)
     if ptype:
         t = _remove_phrase(t, ptype)
 
@@ -583,7 +657,8 @@ def deconstruct_title(title: str, brand: str = "", product_type: str = "",
         chunk = _tidy_punct(clean_ws(chunk))
         if not chunk:
             continue
-        pieces = _split_unpunctuated(chunk) if len(chunk) > 22 else [chunk]
+        # always sub-split: even short runs merge two attributes ("Leakproof Blue")
+        pieces = _split_unpunctuated(chunk)
         for piece in pieces:
             piece = _tidy_punct(clean_ws(piece))
             key = norm(piece)
@@ -599,8 +674,35 @@ def deconstruct_title(title: str, brand: str = "", product_type: str = "",
     colors = [d for d in descriptors if norm(d) in COLOR_WORDS]
     materials = [d for d in descriptors if norm(d) in MATERIAL_WORDS]
 
-    return {"brand": clean_ws(brand), "product_type": ptype, "size": size, "pack": pack,
+    return {"brand": clean_ws(brand), "product_type": ptype, "product_type_confidence": ptype_conf,
+            "size": size, "pack": pack, "dimensions": dims,
             "descriptors": descriptors, "colors": colors, "materials": materials}
+
+
+def detect_from_title(title: str, brand: str = "") -> dict:
+    """Everything the auto-fill button needs from a pasted title."""
+    p = deconstruct_title(title, brand=brand)
+    return {"product_type": p["product_type"], "product_type_confidence": p["product_type_confidence"],
+            "size": p["size"], "pack": p["pack"], "dimensions": p["dimensions"],
+            "descriptors": p["descriptors"], "colors": p["colors"], "materials": p["materials"]}
+
+
+def facts_from_parts(parts: dict) -> ProductFacts:
+    """Turns a deconstructed title into product facts, so bullets can be written
+    for a listing that arrived with no bullets at all."""
+    descriptors = list(parts.get("descriptors", []))
+    colors = parts.get("colors", [])
+    materials = parts.get("materials", [])
+    use_cases = [d for d in descriptors if is_use_case(d)]
+    features = [d for d in descriptors
+                if d not in colors and d not in materials and not is_use_case(d)]
+    return ProductFacts(
+        brand=parts.get("brand", ""), product_type=parts.get("product_type", ""),
+        size=parts.get("size", ""), pack=parts.get("pack", ""),
+        dimensions=parts.get("dimensions", ""),
+        color=colors[0] if colors else "", material=materials[0] if materials else "",
+        use_case=use_cases[0] if use_cases else "",
+        features=[(f, "") for f in features])
 
 
 def smart_title_rebuild(parts: dict, limit: int, minimal: bool = False) -> tuple:
@@ -661,6 +763,7 @@ class ProductFacts:
     secondary_keywords: str = ""
     size: str = ""
     pack: str = ""
+    dimensions: str = ""
     color: str = ""
     material: str = ""
     audience: str = ""
@@ -767,8 +870,22 @@ def build_bullets(f: ProductFacts, max_bullets: int = MAX_BULLETS_SELLER) -> lis
             rows.append((feat, take(feat, benefit)))
 
     if f.size or f.pack:
-        v = variant_string(f)
-        rows.append((v, take(v)))
+        size_txt, pack_txt = clean_ws(f.size), clean_ws(f.pack)
+        n = re.search(r"\d+", pack_txt)
+        bits = []
+        if size_txt:
+            bits.append(f"{size_txt} capacity")
+        if n:
+            bits.append(f"{n.group(0)} in every pack")
+        elif pack_txt:
+            bits.append(pack_txt.lower())
+        lead = ("Size and pack" if (size_txt and pack_txt) else
+                ("Size" if size_txt else "Pack"))
+        rows.append((lead, take(lead, ", ".join(bits))))
+    if f.dimensions:
+        d = clean_ws(f.dimensions)
+        rows.append((f"Measures {d}",
+                     take(d, "so you can check it fits your shelf or cupboard before you order")))
     if f.material:
         rows.append((f"{clean_ws(f.material)} build", take(f.material)))
     if f.use_case:
@@ -1167,48 +1284,80 @@ tab_enhance, tab_build, tab_keywords, tab_rules = st.tabs(
 # ENHANCE
 # ======================================================================
 with tab_enhance:
-    st.markdown("#### Paste what is live now")
-    st.caption("One box for all your bullets — paste as many as you have, one per line. "
-               "Leading dots, dashes and numbering are stripped automatically.")
 
-    eb1, eb2 = st.columns(2)
-    with eb1:
-        e_brand = st.text_input("Brand name", key="e_brand",
-                                help="Always placed first in the rewritten title.")
-    with eb2:
-        e_ptype = st.text_input("Product type", key="e_ptype", placeholder="Bowl, Water Bottle, Mug…",
-                                help="The core noun. Anything else becomes a descriptor that can be "
-                                     "demoted to Item Highlights when space runs out.")
+    def _autofill_from_title():
+        """Runs before the widgets are rebuilt, so it can safely set their values."""
+        det = detect_from_title(st.session_state.get("e_title", ""),
+                                st.session_state.get("e_brand", ""))
+        for src, dst in [("size", "e_size"), ("pack", "e_pack"),
+                         ("product_type", "e_ptype"), ("dimensions", "e_dims")]:
+            if det.get(src):
+                st.session_state[dst] = det[src]
+        st.session_state["_autofill"] = det
 
-    ec1, ec2 = st.columns(2)
-    with ec1:
-        e_size = st.text_input("Size", key="e_size", placeholder="500 ML, 32 oz, 8 inch…")
-    with ec2:
-        e_pack = st.text_input("Pack / count", key="e_pack", placeholder="Pack of 2, 24 Count…")
-    st.caption("Leave size and pack blank to auto-detect them from the title. Both are reserved "
-               "before anything else is placed, so they always survive the cap.")
+    st.markdown("### Step 1 — Paste your current title")
+    st.caption("Then press the button and the details below fill in on their own.")
 
-    e_style = st.radio(
-        "Title style", ["Keyword-rich — use the space that is left", "Minimal — brand, type, size, pack only"],
-        index=0, horizontal=True, key="e_style",
-        help="Keyword-rich fills leftover characters with descriptors, dropping use-case phrases "
-             "first. Minimal keeps only product identity and sends every descriptor to Item Highlights.")
+    e_brand = st.text_input("Brand name", key="e_brand", placeholder="Borosil",
+                            help="This always goes first in the new title.")
+    e_title = st.text_area("Current title", height=80, key="e_title",
+                           placeholder="Borosil Cereal or Salad Glass Bowl 500 ML (Pack of 2) Microwave Safe")
+    st.markdown(counter_pill(char_count(e_title), active_limit), unsafe_allow_html=True)
+    st.button("Read the title and fill in the details", on_click=_autofill_from_title,
+              key="e_autofill", type="secondary")
+
+    det = st.session_state.get("_autofill")
+    if det:
+        found = [f"Size: {det['size']}" if det["size"] else "",
+                 f"Pack: {det['pack']}" if det["pack"] else "",
+                 f"Dimensions: {det['dimensions']}" if det["dimensions"] else "",
+                 f"Product type: {det['product_type']}" if det["product_type"] else ""]
+        found = [f for f in found if f]
+        if found:
+            st.markdown("".join(f'<span class="kwchip kwhit">{esc(x)}</span>' for x in found),
+                        unsafe_allow_html=True)
+            if det.get("product_type_confidence") == "guess":
+                st.caption("The product type is a guess from the last words of the title. "
+                           "Correct it below if it is wrong.")
+        else:
+            st.caption("Nothing detectable in that title. Fill the boxes below by hand.")
+
+    st.markdown("### Step 2 — Check the details")
+    st.caption("Size and pack are locked into the new title. Everything else moves to Item Highlights.")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        e_ptype = st.text_input("Product type", key="e_ptype", placeholder="Bowl")
+    with d2:
+        e_size = st.text_input("Size", key="e_size", placeholder="500 ML")
+    with d3:
+        e_pack = st.text_input("Pack or count", key="e_pack", placeholder="Pack of 2")
+    e_dims = st.text_input("Dimensions, if you have them", key="e_dims",
+                           placeholder="12 x 8 x 4 inches",
+                           help="Used to write a size-and-fit bullet, which cuts returns.")
+
+    st.markdown("### Step 3 — Your current bullets")
+    e_bul = st.text_area("Paste all of them here, one per line. Leave it empty and they get written for you.",
+                         height=165, key="e_bul",
+                         placeholder="• Microwave and dishwasher safe\n- Made from toughened glass\n3. Ideal for cereal, salad and soup")
+    _preview = parse_pasted_lines(e_bul)
+    st.caption(f"Found **{len(_preview)}** bullets." if _preview
+               else "Empty, so bullets will be written from the details in Step 2.")
+
+    with st.expander("Title style — advanced"):
+        e_style = st.radio(
+            "How much should the title carry?",
+            ["Keyword-rich — use the space that is left",
+             "Minimal — brand, type, size and pack only"],
+            index=0, key="e_style",
+            help="Keyword-rich fills leftover characters and drops use-case phrases first. "
+                 "Minimal sends every descriptor to Item Highlights.")
+        e_high = st.text_area("Current Item Highlights, if you already have them", height=68, key="e_high")
+        st.markdown(counter_pill(char_count(e_high), HIGHLIGHT_LIMIT), unsafe_allow_html=True)
     e_minimal = e_style.startswith("Minimal")
 
-    e_title = st.text_area("Current title", height=68, key="e_title")
-    st.markdown(counter_pill(char_count(e_title), active_limit), unsafe_allow_html=True)
-
-    e_high = st.text_area("Current Item Highlights, if any", height=68, key="e_high")
-    st.markdown(counter_pill(char_count(e_high), HIGHLIGHT_LIMIT), unsafe_allow_html=True)
-
-    e_bul = st.text_area("All bullet points — paste them all here, one per line", height=190, key="e_bul",
-                         placeholder="• Keeps drinks cold for 24 hours\n• Leakproof lid seals tight\n"
-                                     "3. Dishwasher safe and BPA free")
-    _preview = parse_pasted_lines(e_bul)
-    if _preview:
-        st.caption(f"Detected **{len(_preview)}** bullets.")
-
-    if st.button("Audit and fix", type="primary", key="e_go"):
+    st.markdown("")
+    if st.button("Fix my listing", type="primary", key="e_go", use_container_width=True):
         bullets_in = parse_pasted_lines(e_bul)
         audits = [audit_title(e_title, e_brand, media_mode), audit_highlights(e_high)]
         audits += [audit_bullet(b, i + 1) for i, b in enumerate(bullets_in)]
@@ -1224,14 +1373,29 @@ with tab_enhance:
 
         # --- smart breakdown: parse into parts, then rebuild in priority order ---
         parts = deconstruct_title(e_title, brand=e_brand, product_type=e_ptype,
-                                  size_override=e_size, pack_override=e_pack)
+                                  size_override=e_size, pack_override=e_pack,
+                                  dimensions_override=e_dims)
         fixed_title, demoted = smart_title_rebuild(parts, active_limit, minimal=e_minimal)
         fixed_title = fix_title(fixed_title, e_brand, media_mode)[0]
         fixed_title = enforce_brand_first(fixed_title, e_brand)
 
         overflow = ", ".join(demoted)
         fixed_high = fix_highlights(e_high, appended=overflow)
-        fixed_bullets = [fix_bullet(b) for b in bullets_in][:max_bullets]
+
+        # Item Highlights is searchable, so never leave it blank. If the title
+        # absorbed everything, fill it from the parsed details instead.
+        highlights_generated = False
+        if not fixed_high.strip():
+            fixed_high = build_highlights(facts_from_parts(parts), "", extra_keywords=targets)
+            highlights_generated = bool(fixed_high.strip())
+
+        # bullets: clean what was pasted, or write them from the parsed details
+        bullets_generated = False
+        if bullets_in:
+            fixed_bullets = [fix_bullet(b) for b in bullets_in][:max_bullets]
+        else:
+            fixed_bullets = build_bullets(facts_from_parts(parts), max_bullets)
+            bullets_generated = True
 
         with st.expander("How the old title was broken down", expanded=True):
             bd1, bd2 = st.columns(2)
@@ -1239,25 +1403,20 @@ with tab_enhance:
                 st.markdown(
                     f"**Kept in the title**\n\n"
                     f"- Brand: `{parts['brand'] or '—'}`\n"
-                    f"- Product type: `{parts['product_type'] or '(not given)'}`\n"
+                    f"- Product type: `{parts['product_type'] or '—'}`\n"
                     f"- Size: `{parts['size'] or '—'}`\n"
                     f"- Pack: `{parts['pack'] or '—'}`")
             with bd2:
-                if demoted:
-                    st.markdown("**Moved to Item Highlights**\n\n"
-                                + "\n".join(f"- {d}" for d in demoted))
-                else:
-                    st.markdown("**Moved to Item Highlights**\n\nNothing — it all fit.")
-            if not parts["product_type"]:
-                st.info("Add a product type above and the rebuild gets sharper — the tool can then "
-                        "tell the core noun apart from descriptors like a use case.")
+                st.markdown("**Moved to Item Highlights**\n\n"
+                            + ("\n".join(f"- {d}" for d in demoted) if demoted else "Nothing — it all fit."))
 
         if use_ai:
             brief = (f"Rewrite this listing to be fully compliant, keeping its meaning and keywords.\n"
                      f"The title MUST start with the brand name and MUST contain the size and pack.\n"
-                     f"Brand: {e_brand}\nProduct type: {e_ptype}\nSize: {parts['size']}\n"
-                     f"Pack: {parts['pack']}\nTitle: {e_title}\nHighlights: {e_high}\n"
-                     f"Bullets: {bullets_in}\nTarget search terms: {', '.join(targets)}")
+                     f"Brand: {e_brand}\nProduct type: {parts['product_type']}\nSize: {parts['size']}\n"
+                     f"Pack: {parts['pack']}\nDimensions: {parts['dimensions']}\nTitle: {e_title}\n"
+                     f"Highlights: {e_high}\nBullets: {bullets_in or 'none, write five'}\n"
+                     f"Target search terms: {', '.join(targets)}")
             data = ai_generate(provider, api_key, model, brief)
             if data:
                 fixed_title = fix_title(data.get("title") or fixed_title, e_brand, media_mode)[0]
@@ -1267,6 +1426,13 @@ with tab_enhance:
             elif st.session_state.get("_ai_error"):
                 st.warning(f"AI polish unavailable, showing the rule-based rewrite. "
                            f"({st.session_state['_ai_error']})")
+
+        if highlights_generated:
+            st.info("Item Highlights was empty, so it was filled from the product details. "
+                    "The field is searchable, so leaving it blank gives up free ranking surface.")
+        if bullets_generated and fixed_bullets:
+            st.info("You had no bullets, so these were written from the details in Step 2. "
+                    "Treat them as a first draft and add anything only you would know.")
 
         render_output_block(fixed_title, fixed_high, fixed_bullets, media_mode, key="enh")
 
@@ -1307,9 +1473,12 @@ with tab_build:
 
     b4, b5 = st.columns(2)
     with b4:
-        f_aud = st.text_input("Audience → highlights", key="b_aud", placeholder="for men, for toddlers…")
+        f_aud = st.text_input("Who it is for → highlights", key="b_aud", placeholder="for men, for toddlers…")
     with b5:
-        f_use = st.text_input("Use case → highlights", key="b_use", placeholder="for cold brew, for travel…")
+        f_use = st.text_input("What it is used for → highlights", key="b_use",
+                              placeholder="for cold brew, for travel…")
+    f_dims = st.text_input("Dimensions", key="b_dims", placeholder="12 x 8 x 4 inches",
+                           help="Used to write a size-and-fit bullet, which cuts returns.")
 
     f_feats_raw = st.text_area(
         "Key features — paste them all here, one per line", height=180, key="b_feats",
@@ -1326,7 +1495,8 @@ with tab_build:
         else:
             facts = ProductFacts(
                 brand=f_brand, product_type=f_type, item_name=f_item, primary_keyword=f_pk,
-                secondary_keywords=f_sk, size=f_size, pack=f_pack, color=f_color, material=f_mat,
+                secondary_keywords=f_sk, size=f_size, pack=f_pack, dimensions=f_dims,
+                color=f_color, material=f_mat,
                 audience=f_aud, use_case=f_use, features=parse_features(f_feats_raw))
 
             title = build_title(facts, media_mode)
