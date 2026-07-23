@@ -56,7 +56,9 @@ TITLE_LIMIT_STANDARD = 75
 TITLE_LIMIT_MEDIA = 200
 HIGHLIGHT_LIMIT = 125
 BULLET_HARD_LIMIT = 500
-BULLET_SOFT_TARGET = 240
+BULLET_SOFT_TARGET = 320        # above this it gets long even on desktop
+BULLET_MIN_TARGET = 110         # below this a bullet is too thin to earn its slot
+BULLET_ELABORATE_TARGET = 210   # what generated and expanded bullets aim for
 MAX_BULLETS_SELLER = 5
 MAX_BULLETS_VENDOR = 10
 
@@ -349,7 +351,11 @@ def audit_bullet(text: str, idx: int) -> FieldAudit:
         a.issues.append(Issue(SEV_ERROR, f"{a.count}/{BULLET_HARD_LIMIT}, over Amazon's per-bullet cap."))
     elif a.count > BULLET_SOFT_TARGET:
         a.issues.append(Issue(SEV_WARN,
-                              f"{a.count} chars, long for mobile. Aim for {BULLET_SOFT_TARGET} or under."))
+                              f"{a.count} chars, getting long. {BULLET_SOFT_TARGET} is a comfortable ceiling."))
+    elif a.count < BULLET_MIN_TARGET:
+        a.issues.append(Issue(SEV_WARN,
+                              f"Only {a.count} chars, too thin to earn a bullet slot. Amazon allows "
+                              f"{BULLET_HARD_LIMIT}, so add the benefit and the context around it."))
     first = text.strip()[:1]
     if first and first.isalpha() and not first.isupper():
         a.issues.append(Issue(SEV_WARN, "Should start with a capital letter."))
@@ -906,12 +912,12 @@ def build_bullets(f: ProductFacts, max_bullets: int = MAX_BULLETS_SELLER) -> lis
                      take(f.color, "holds a clean, consistent look on the shelf and in use")))
 
     bullets, seen = [], set()
+    used_clauses = set()
     for lead, benefit in rows:
         lead = clean_ws(lead).rstrip(":")
         if not lead:
             continue
-        head = lead.upper() if len(lead) <= 28 else lead[:1].upper() + lead[1:]
-        b = fix_bullet(f"{head}: {benefit}")
+        b = elaborate_bullet(lead, benefit, f, used_clauses)
         key = norm(b)[:40]
         if not b or key in seen:
             continue
@@ -920,6 +926,237 @@ def build_bullets(f: ProductFacts, max_bullets: int = MAX_BULLETS_SELLER) -> lis
         if len(bullets) >= max_bullets:
             break
     return bullets
+
+# ----------------------------------------------------------------------
+# Bullet elaboration — build substantial bullets, not one-line fragments
+# ----------------------------------------------------------------------
+# Amazon allows 500 characters per bullet and thin bullets waste the slot, so
+# generated and expanded bullets aim for roughly BULLET_ELABORATE_TARGET by
+# layering context clauses drawn from the product facts. Each clause is used
+# once across the whole set, so five bullets never repeat the same sentence.
+
+def _context_clauses(f: "ProductFacts") -> list:
+    """Continuation clauses built from whatever facts exist, in priority order."""
+    out = []
+    size, pack = clean_ws(f.size), clean_ws(f.pack)
+    n = re.search(r"\d+", pack)
+    if size:
+        out.append(f"the {size} size covers everyday use without being awkward to handle")
+    if n:
+        out.append(f"and with {n.group(0)} in every pack there is always a spare ready to go")
+    elif pack:
+        out.append(f"and it arrives as {pack.lower()} so you are not reordering straight away")
+    if f.material:
+        out.append(f"the {clean_ws(f.material).lower()} construction takes daily handling "
+                   f"without looking tired after a few weeks")
+    if f.dimensions:
+        out.append(f"it measures {clean_ws(f.dimensions)}, so you can check it fits your shelf "
+                   f"or cupboard before ordering")
+    if f.use_case:
+        uc = clean_ws(f.use_case)
+        out.append(f"which is exactly what you want {uc if uc.lower().startswith('for') else 'for ' + uc}")
+    if f.audience:
+        aud = clean_ws(f.audience)
+        out.append(f"and it suits anyone shopping {aud if aud.lower().startswith('for') else 'for ' + aud}")
+    if f.color:
+        out.append(f"the {clean_ws(f.color).lower()} finish stays looking consistent on an open shelf")
+    return out
+
+
+def _join_clauses(parts: list) -> str:
+    """Joins clauses into one readable sentence fragment."""
+    cleaned = []
+    for i, p in enumerate(parts):
+        p = clean_ws(p)
+        if not p:
+            continue
+        if i and not p.lower().startswith(("and ", "so ", "which ", "the ", "it ")):
+            p = "and " + p
+        cleaned.append(p)
+    return clean_ws(", ".join(cleaned))
+
+
+# Varied closers, used only to top up a bullet that is still thin after its
+# context clauses. Each is used once per listing so nothing reads templated.
+BULLET_CLOSERS = [
+    "which keeps the day-to-day routine simple",
+    "so there are no surprises once it arrives",
+    "and it holds up to repeated use over time",
+    "so it earns the space it takes up",
+    "and there is nothing fiddly to get used to",
+    "which is one less thing to think about",
+]
+
+
+def _clause_redundant(clause: str, said: str) -> bool:
+    """True when a clause would repeat a measurement the bullet already states,
+    e.g. adding 'the 500 ML size…' to a bullet already headed 'SIZE AND PACK'."""
+    keys = [w for w in norm(clause).split()
+            if w.isdigit() or w in {"ml", "oz", "litre", "liter", "inches", "inch", "cm", "mm", "kg", "g"}]
+    return bool(keys) and all(k in said for k in keys)
+
+
+def elaborate_bullet(lead: str, benefit: str, f: "ProductFacts", used: set,
+                     target: int = BULLET_ELABORATE_TARGET, max_clauses: int = 2) -> str:
+    """LEAD: benefit, plus a couple of context clauses so the bullet is substantial.
+    Capped per bullet so the first two do not swallow every available clause."""
+    parts = [clean_ws(benefit)] if clean_ws(benefit) else []
+    said = norm(f"{lead} {benefit}")
+    added = 0
+    for clause in _context_clauses(f):
+        if added >= max_clauses or len(_join_clauses(parts)) >= target:
+            break
+        if clause in used or _clause_redundant(clause, said):
+            continue
+        used.add(clause)
+        parts.append(clause)
+        said = norm(f"{said} {clause}")
+        added += 1
+    if len(_join_clauses(parts)) < BULLET_MIN_TARGET:
+        for closer in BULLET_CLOSERS:
+            if closer in used:
+                continue
+            used.add(closer)
+            parts.append(closer)
+            if len(_join_clauses(parts)) >= BULLET_MIN_TARGET:
+                break
+    body = _join_clauses(parts)
+    head = lead.upper() if len(lead) <= 30 else lead[:1].upper() + lead[1:]
+    return fix_bullet(f"{head}: {body}" if body else head)
+
+
+def expand_existing_bullet(bullet: str, f: "ProductFacts", used: set,
+                           target: int = BULLET_ELABORATE_TARGET) -> str:
+    """Pads a thin bullet the seller already wrote, leaving good ones alone."""
+    b = fix_bullet(bullet)
+    if char_count(b) >= target * 0.75:
+        return b
+    parts = [b]
+    said = norm(b)
+    added = 0
+    for clause in _context_clauses(f):
+        if added >= 2 or len(_join_clauses(parts)) >= target:
+            break
+        if clause in used or _clause_redundant(clause, said):
+            continue
+        used.add(clause)
+        parts.append(clause)
+        said = norm(f"{said} {clause}")
+        added += 1
+    if len(_join_clauses(parts)) < BULLET_MIN_TARGET:
+        for closer in BULLET_CLOSERS:
+            if closer in used:
+                continue
+            used.add(closer)
+            parts.append(closer)
+            if len(_join_clauses(parts)) >= BULLET_MIN_TARGET:
+                break
+    return fix_bullet(_join_clauses(parts))
+
+
+# ----------------------------------------------------------------------
+# Paragraph input -> five bullets
+# ----------------------------------------------------------------------
+
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+
+
+def looks_like_paragraph(text: str) -> bool:
+    """True when the pasted text is prose rather than one bullet per line."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    if len(lines) >= 3:
+        return False
+    body = clean_ws(text)
+    return char_count(body) > 180 and len(re.findall(r"[.!?]", body)) >= 2
+
+
+def _derive_lead(chunk: str, used_leads: set) -> tuple:
+    """Returns (lead, strippable). A lead taken from a recognised attribute phrase
+    may be removed from the body; a thematic fallback never is, because cutting
+    the opening words apart produces fragments like 'IT MEASURES 12: x 8 inches'."""
+    low = norm(chunk)
+    for ph in sorted(list(ATTRIBUTE_PHRASES) + list(BENEFIT_HINTS.keys()), key=len, reverse=True):
+        if len(ph) < 5:
+            continue
+        if re.search(r"(?<![a-z0-9])" + re.escape(ph) + r"(?![a-z0-9])", low):
+            lead = ph.upper()
+            if lead not in used_leads:
+                return lead, low.startswith(ph)
+
+    themed = []
+    if re.search(r"\d+\s*(ml|oz|litre|liter|cm|mm|inch|inches|kg|g)\b", low) or " x " in low:
+        themed.append("SIZE AND FIT")
+    if any(w in low for w in ("use it", "ideal for", "great for", "perfect for", "designed for")):
+        themed.append("EVERYDAY USE")
+    if any(w in low for w in ("clean", "wash", "wipe", "rinse")):
+        themed.append("EASY TO LOOK AFTER")
+    if any(w in low for w in ("made", "material", "glass", "steel", "plastic", "wood", "cotton")):
+        themed.append("WHAT IT IS MADE OF")
+    themed += ["KEY DETAIL", "ALSO WORTH KNOWING", "GOOD TO KNOW", "ONE MORE THING", "IN THE BOX"]
+    for lead in themed:
+        if lead not in used_leads:
+            return lead, False
+    return "KEY DETAIL", False
+
+
+def split_paragraph_into_bullets(text: str, max_bullets: int = MAX_BULLETS_SELLER) -> list:
+    """Breaks prose into balanced bullets on sentence boundaries, falling back to
+    clause boundaries when there are not enough sentences to go round."""
+    body = clean_ws(strip_html(strip_emoji(text)))
+    if not body:
+        return []
+
+    units = [s for s in SENTENCE_SPLIT_RE.split(body) if clean_ws(s)]
+    # not enough sentences: break the longest ones on semicolons or ' and '
+    while len(units) < max_bullets:
+        longest = max(range(len(units)), key=lambda i: len(units[i])) if units else None
+        if longest is None or len(units[longest]) < 90:
+            break
+        piece = units[longest]
+        cut = re.split(r"\s*;\s*|\s+(?:and|plus|while|whereas)\s+", piece, maxsplit=1)
+        if len(cut) < 2 or min(len(c) for c in cut) < 30:
+            break
+        units[longest:longest + 1] = [clean_ws(cut[0]), clean_ws(cut[1])]
+
+    if not units:
+        return []
+
+    # pack sentences into at most max_bullets groups, balanced by length
+    groups, target = [], max(1, sum(len(u) for u in units) // min(max_bullets, len(units)) + 1)
+    current = ""
+    for u in units:
+        candidate = clean_ws(f"{current} {u}") if current else clean_ws(u)
+        if current and len(candidate) > target and len(groups) < max_bullets - 1:
+            groups.append(current)
+            current = clean_ws(u)
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+
+    bullets, used_leads = [], set()
+    for grp in groups[:max_bullets]:
+        body_txt = clean_ws(grp)
+        lead, strippable = _derive_lead(body_txt, used_leads)
+        used_leads.add(lead)
+        if strippable and norm(body_txt).startswith(norm(lead)):
+            trimmed = clean_ws(body_txt[len(lead):]).lstrip(",.;: ")
+            # only accept the trim if what remains still reads as a clause
+            if len(trimmed.split()) >= 4:
+                body_txt = trimmed
+        b = fix_bullet(f"{lead}: {body_txt}" if body_txt else grp)
+        if b:
+            bullets.append(b)
+    return bullets
+
+
+def parse_bullets_smart(text: str, max_bullets: int = MAX_BULLETS_SELLER) -> tuple:
+    """Returns (bullets, mode). Detects prose and splits it, otherwise treats the
+    input as one bullet per line."""
+    if looks_like_paragraph(text):
+        return split_paragraph_into_bullets(text, max_bullets), "paragraph"
+    return parse_pasted_lines(text), "lines"
+
 
 # ----------------------------------------------------------------------
 # Keyword research — Google and Amazon search suggestions
@@ -1567,12 +1804,25 @@ with tab_enhance:
                            help="Used to write a size-and-fit bullet, which cuts returns.")
 
     st.markdown("### Step 3 — Your current bullets")
-    e_bul = st.text_area("Paste all of them here, one per line. Leave it empty and they get written for you.",
-                         height=165, key="e_bul",
-                         placeholder="• Microwave and dishwasher safe\n- Made from toughened glass\n3. Ideal for cereal, salad and soup")
-    _preview = parse_pasted_lines(e_bul)
-    st.caption(f"Found **{len(_preview)}** bullets." if _preview
-               else "Empty, so bullets will be written from the details in Step 2.")
+    e_bul = st.text_area(
+        "Paste your bullets here — one per line, or just paste a paragraph and it gets split up. "
+        "Leave it empty and they get written for you.",
+        height=175, key="e_bul",
+        placeholder="• Microwave and dishwasher safe\n- Made from toughened glass\n"
+                    "3. Ideal for cereal, salad and soup\n\n…or paste a full paragraph of "
+                    "product description and it will be broken into bullets.")
+    _preview, _mode = parse_bullets_smart(e_bul, max_bullets)
+    if _preview and _mode == "paragraph":
+        st.caption(f"Looks like a paragraph, so it will be split into **{len(_preview)}** bullets.")
+    elif _preview:
+        st.caption(f"Found **{len(_preview)}** bullets.")
+    else:
+        st.caption("Empty, so bullets will be written from the details in Step 2.")
+
+    e_expand = st.checkbox(
+        "Expand short bullets using the product details", value=True, key="e_expand",
+        help=f"Amazon allows {BULLET_HARD_LIMIT} characters per bullet. Thin one-liners waste the "
+             f"slot, so anything short gets the size, pack, material and fit detail layered in.")
 
     with st.expander("Title style — advanced"):
         e_style = st.radio(
@@ -1588,7 +1838,7 @@ with tab_enhance:
 
     st.markdown("")
     if st.button("Fix my listing", type="primary", key="e_go", use_container_width=True):
-        bullets_in = parse_pasted_lines(e_bul)
+        bullets_in, bullet_mode = parse_bullets_smart(e_bul, max_bullets)
         audits = [audit_title(e_title, e_brand, media_mode), audit_highlights(e_high)]
         audits += [audit_bullet(b, i + 1) for i, b in enumerate(bullets_in)]
         render_scorecard(audits)
@@ -1621,10 +1871,16 @@ with tab_enhance:
 
         # bullets: clean what was pasted, or write them from the parsed details
         bullets_generated = False
+        facts_for_bullets = facts_from_parts(parts)
         if bullets_in:
-            fixed_bullets = [fix_bullet(b) for b in bullets_in][:max_bullets]
+            if e_expand:
+                used_clauses = set()
+                fixed_bullets = [expand_existing_bullet(b, facts_for_bullets, used_clauses)
+                                 for b in bullets_in][:max_bullets]
+            else:
+                fixed_bullets = [fix_bullet(b) for b in bullets_in][:max_bullets]
         else:
-            fixed_bullets = build_bullets(facts_from_parts(parts), max_bullets)
+            fixed_bullets = build_bullets(facts_for_bullets, max_bullets)
             bullets_generated = True
 
         with st.expander("How the old title was broken down", expanded=True):
@@ -1657,6 +1913,9 @@ with tab_enhance:
                 st.warning(f"AI polish unavailable, showing the rule-based rewrite. "
                            f"({st.session_state['_ai_error']})")
 
+        if bullets_in and bullet_mode == "paragraph":
+            st.info(f"That looked like a paragraph, so it was split into {len(bullets_in)} bullets "
+                    f"on sentence boundaries. Check the split reads the way you intended.")
         if highlights_generated:
             st.info("Item Highlights was empty, so it was filled from the product details. "
                     "The field is searchable, so leaving it blank gives up free ranking surface.")
