@@ -4,7 +4,9 @@ Rules engine lives in core.py. This file is presentation only.
 """
 import json, re, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+import json
 import streamlit as st
+import streamlit.components.v1 as components
 import core as C
 import images as IMG
 from PIL import Image
@@ -12,19 +14,25 @@ from PIL import Image
 st.set_page_config(page_title="Listing Studio", page_icon="🛍️", layout="wide")
 
 st.markdown("""<style>
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
 .stApp{background:#fff}
-html,body,[class*="css"]{font-family:'Inter',system-ui,sans-serif;color:#1b2233}
-h1,h2,h3,h4,h5{font-family:'Plus Jakarta Sans',sans-serif;color:#141a29;letter-spacing:-.02em}
+html,body,[class*="css"]{font-family:'Atkinson Hyperlegible','Inter',system-ui,sans-serif;
+ color:#0f1419;font-size:16px;line-height:1.55}
+h1,h2,h3,h4,h5{font-family:'Archivo',sans-serif;color:#0b0f14;letter-spacing:-.015em}
+.stMarkdown p,label,li{font-size:15.5px;color:#26303c}
+.stCodeBlock code,pre code{font-family:'JetBrains Mono',monospace!important;font-size:15px!important;
+ line-height:1.6!important;color:#0f1419!important}
+.stCodeBlock{border:1px solid #d7dce4!important;border-radius:10px!important;background:#fbfcfe!important}
+input,textarea{font-size:15.5px!important;color:#0f1419!important}
 .block-container{padding-top:1.3rem;max-width:1380px}
 .hero{background:linear-gradient(115deg,#ffe29a,#ff9a8b 38%,#ff6fa5 68%,#7b6cff);
  border-radius:18px;padding:20px 24px;margin-bottom:16px;box-shadow:0 10px 26px rgba(123,108,255,.2)}
 .hero h1{font-size:25px;font-weight:800;margin:0;color:#20142e}
 .hero p{margin:6px 0 0;font-size:13px;color:#3a2440;font-weight:500;max-width:840px}
 .lbl{display:flex;justify-content:space-between;align-items:baseline;margin:14px 0 2px}
-.lbl b{font-size:13.5px;font-weight:700;color:#141a29}
-.lbl span{font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:700;
- padding:2px 9px;border-radius:999px}
+.lbl b{font-size:15px;font-weight:700;color:#0b0f14}
+.lbl span{font-family:'JetBrains Mono',monospace;font-size:12.5px;font-weight:700;
+ padding:3px 10px;border-radius:999px}
 .ok{background:#dcfce7;color:#0b7a46;border:1px solid #86efac}
 .warn{background:#fef3c7;color:#96690b;border:1px solid #fcd34d}
 .bad{background:#ffe4e6;color:#b4143c;border:1px solid #fda4af}
@@ -33,7 +41,7 @@ h1,h2,h3,h4,h5{font-family:'Plus Jakarta Sans',sans-serif;color:#141a29;letter-s
  box-shadow:0 4px 14px rgba(20,26,41,.06)}
 .sc .n{font-family:'JetBrains Mono',monospace;font-size:38px;font-weight:700;line-height:1}
 .sc .m{font-size:12.5px;color:#6b7391}
-.iss{font-size:12.5px;padding:7px 12px;border-radius:9px;margin:4px 0;background:#f7f9fc;
+.iss{font-size:14px;padding:7px 12px;border-radius:9px;margin:4px 0;background:#f7f9fc;
  border-left:4px solid #cbd5e1;color:#3a4256}
 .iss.error{background:#fff1f2;border-left-color:#f43f5e}
 .iss.warn{background:#fffbeb;border-left-color:#f59e0b}
@@ -41,7 +49,7 @@ h1,h2,h3,h4,h5{font-family:'Plus Jakarta Sans',sans-serif;color:#141a29;letter-s
 .chip{display:inline-block;font-size:12px;font-weight:600;padding:4px 10px;margin:3px;
  border-radius:999px;border:1px solid}
 .stTabs [data-baseweb="tab-list"]{gap:6px}
-[data-baseweb="tab"]{font-weight:700;font-family:'Plus Jakarta Sans',sans-serif}
+[data-baseweb="tab"]{font-weight:700;font-family:'Archivo',sans-serif;font-size:16px}
 div.stButton>button[kind="primary"]{background:#7b6cff;border:0;font-weight:700;border-radius:10px}
 </style>""", unsafe_allow_html=True)
 
@@ -52,6 +60,35 @@ st.markdown('<div class="hero"><h1>Listing Studio</h1><p>Amazon title, item high
 # --------------------------------------------------------------- helpers
 def cls(count, limit):
     return "bad" if count > limit else "warn" if count > limit * .9 else "ok"
+
+def copy_button(text, key, caption=""):
+    """Visible copy control above the box. st.code below keeps its own native
+    copy icon as a fallback if the browser blocks the clipboard call."""
+    payload = json.dumps(text or "")
+    components.html(f"""
+      <div style="display:flex;align-items:center;gap:10px;font-family:'Atkinson Hyperlegible',
+                  system-ui,sans-serif">
+        <button id="cb{key}" style="background:#7b6cff;color:#fff;border:0;border-radius:8px;
+          padding:7px 16px;font-size:14px;font-weight:700;cursor:pointer">Copy</button>
+        <span style="font-size:13px;color:#5b6472">{C.esc(caption)}</span>
+      </div>
+      <script>
+        const t{key} = {payload};
+        const b{key} = document.getElementById("cb{key}");
+        b{key}.onclick = async () => {{
+          try {{ await navigator.clipboard.writeText(t{key}); }}
+          catch (e) {{
+            const ta = document.createElement('textarea');
+            ta.value = t{key}; ta.style.position='fixed'; ta.style.opacity='0';
+            document.body.appendChild(ta); ta.select();
+            try {{ document.execCommand('copy'); }} catch (err) {{}}
+            document.body.removeChild(ta);
+          }}
+          b{key}.textContent = 'Copied'; b{key}.style.background = '#22c55e';
+          setTimeout(() => {{ b{key}.textContent='Copy'; b{key}.style.background='#7b6cff'; }}, 1400);
+        }};
+      </script>""", height=44)
+
 
 def label(text, count=None, limit=None, unit="characters"):
     right = f'<span class="{cls(count,limit)}">{count} / {limit} {unit}</span>' if limit else ""
@@ -74,18 +111,27 @@ def scorecard(audits):
 def copy_out(title, high, bullets, backend="", desc="", key="x"):
     live = [b for b in bullets if b]
     st.markdown("#### Copy each field")
-    label("Title", C.clen(title), C.TITLE_LIMIT); st.code(title or "", language=None)
-    label("Item Highlights", C.clen(high), C.HIGHLIGHT_LIMIT); st.code(high or "", language=None)
+    label("Title", C.clen(title), C.TITLE_LIMIT)
+    copy_button(title, f"t{key}"); st.code(title or "", language=None)
+
+    label("Item Highlights", C.clen(high), C.HIGHLIGHT_LIMIT)
+    copy_button(high, f"h{key}"); st.code(high or "", language=None)
+
     for i, b in enumerate(live, 1):
-        label(f"Bullet {i}", C.clen(b), C.BULLET_MAX); st.code(b, language=None)
+        label(f"Bullet {i}", C.clen(b), C.BULLET_MAX)
+        copy_button(b, f"b{key}{i}"); st.code(b, language=None)
+
     label(f"All {len(live)} bullets, one per line",
           sum(C.clen(b) for b in live), C.BULLETS_TOTAL_MAX)
+    copy_button("\n".join(live), f"all{key}", "one bullet per line")
     st.code("\n".join(live), language=None)
+
     if backend:
         label("Backend search terms", C.blen(backend), C.BACKEND_BYTES, "bytes")
-        st.code(backend, language=None)
+        copy_button(backend, f"k{key}"); st.code(backend, language=None)
     if desc:
-        label("Description", C.clen(desc), C.DESCRIPTION_LIMIT); st.code(desc, language=None)
+        label("Description", C.clen(desc), C.DESCRIPTION_LIMIT)
+        copy_button(desc, f"d{key}"); st.code(desc, language=None)
     pack = "\n".join([f"TITLE\n{title}", f"\nITEM HIGHLIGHTS\n{high}", "\nBULLETS"]
                      + [f"- {b}" for b in live] + ([f"\nSEARCH TERMS\n{backend}"] if backend else []))
     st.download_button("Download everything (.txt)", pack.encode(), "listing.txt",
@@ -116,54 +162,76 @@ tabs = st.tabs(["Build a listing", "Improve a listing", "Listing images",
 # ================================================================ BUILD
 with tabs[0]:
     st.markdown("### Product details")
-    st.caption("Five fields build the title: brand, then the attribute that qualifies the product, "
-               "then the product type, then the differentiator and size. Output updates as you type.")
+    st.caption("Fields are read in priority order. Whatever will not fit the 75-character title "
+               "drops into Item Highlights, and whatever will not fit there becomes bullet "
+               "material. Nothing is thrown away.")
 
     def clear_build():
-        for k in ("b_brand","b_type","b_a1","b_a2","b_size","b_use","b_feat"):
+        for k in ("f_brand","f_type","f_a1","f_a2","f_a3","f_a4","f_usp","f_size","f_use","f_feat"):
             st.session_state[k] = ""
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown('<div class="lbl"><b>Brand name</b></div>', unsafe_allow_html=True)
-        brand = st.text_input("brand", key="b_brand", label_visibility="collapsed",
-                              placeholder="Rider")
-        st.markdown('<div class="lbl"><b>Product type</b></div>', unsafe_allow_html=True)
-        ptype = st.text_input("ptype", key="b_type", label_visibility="collapsed",
-                              placeholder="Scooter Helmet")
-    with c2:
-        st.markdown('<div class="lbl"><b>Attribute 1</b></div>', unsafe_allow_html=True)
-        a1 = st.text_input("a1", key="b_a1", label_visibility="collapsed",
-                           placeholder="ABS Shell — material, line or model")
-        st.markdown('<div class="lbl"><b>Attribute 2</b></div>', unsafe_allow_html=True)
-        a2 = st.text_input("a2", key="b_a2", label_visibility="collapsed",
-                           placeholder="Matte Black — colour or differentiator")
-    with c3:
-        st.markdown('<div class="lbl"><b>Size</b></div>', unsafe_allow_html=True)
-        size = st.text_input("size", key="b_size", label_visibility="collapsed",
-                             placeholder="3/4 or Pack of 2")
-        st.markdown('<div class="lbl"><b>Used for</b></div>', unsafe_allow_html=True)
-        use = st.text_input("use", key="b_use", label_visibility="collapsed",
-                            placeholder="for scooters and skateboards")
+    r1c1, r1c2, r1c3 = st.columns(3)
+    with r1c1:
+        st.markdown('<div class="lbl"><b>1 · Brand name</b></div>', unsafe_allow_html=True)
+        brand = st.text_input("br", key="f_brand", label_visibility="collapsed", placeholder="Rider")
+    with r1c2:
+        st.markdown('<div class="lbl"><b>2 · Attribute 1 — the strongest qualifier</b></div>',
+                    unsafe_allow_html=True)
+        a1 = st.text_input("a1", key="f_a1", label_visibility="collapsed",
+                           placeholder="Real Carbon Fibre")
+    with r1c3:
+        st.markdown('<div class="lbl"><b>3 · Product type</b></div>', unsafe_allow_html=True)
+        ptype = st.text_input("pt", key="f_type", label_visibility="collapsed",
+                              placeholder="Modular Motorcycle Helmet")
+
+    r2c1, r2c2, r2c3 = st.columns(3)
+    with r2c1:
+        st.markdown('<div class="lbl"><b>4 · USP</b></div>', unsafe_allow_html=True)
+        usp = st.text_input("up", key="f_usp", label_visibility="collapsed",
+                            placeholder="1.48 kg Lightweight")
+    with r2c2:
+        st.markdown('<div class="lbl"><b>5 · Size or gender</b></div>', unsafe_allow_html=True)
+        size = st.text_input("sz", key="f_size", label_visibility="collapsed",
+                             placeholder="Medium, 500 ML or Men's")
+    with r2c3:
+        st.markdown('<div class="lbl"><b>6 · Attribute 2</b></div>', unsafe_allow_html=True)
+        a2 = st.text_input("a2", key="f_a2", label_visibility="collapsed", placeholder="Dual Visor")
+
+    r3c1, r3c2 = st.columns(2)
+    with r3c1:
+        st.markdown('<div class="lbl"><b>7 · Attribute 3</b></div>', unsafe_allow_html=True)
+        a3 = st.text_input("a3", key="f_a3", label_visibility="collapsed",
+                           placeholder="DOT and ECE Certified")
+    with r3c2:
+        st.markdown('<div class="lbl"><b>8 · Attribute 4</b></div>', unsafe_allow_html=True)
+        a4 = st.text_input("a4", key="f_a4", label_visibility="collapsed",
+                           placeholder="Flip Up Chin Bar")
+
+    st.markdown('<div class="lbl"><b>Used for</b></div>', unsafe_allow_html=True)
+    use = st.text_input("uc", key="f_use", label_visibility="collapsed",
+                        placeholder="for touring and daily commuting")
 
     st.markdown('<div class="lbl"><b>Features — one per line, or paste a paragraph</b></div>',
                 unsafe_allow_html=True)
-    feat_raw = st.text_area("feat", key="b_feat", height=140, label_visibility="collapsed",
-        placeholder="11 vents keep air moving over the head\nAdjustable dial fit 54 to 58 cm\n"
-                    "Meets CPSC safety standard")
-    st.button("Clear all boxes", key="b_clear", on_click=clear_build)
+    feat_raw = st.text_area("ft", key="f_feat", height=140, label_visibility="collapsed",
+        placeholder="Superior Ventilation System: top and rear vents keep air moving\n"
+                    "Retractable sun visor cuts glare without swapping shields\n"
+                    "Quick release buckle opens with one hand")
+    st.caption("Write your own ALL CAPS heading followed by a colon and it is kept as the bullet "
+               "heading. Styled or bold pasted text is folded back to plain characters, since "
+               "Amazon rejects those symbols.")
+    st.button("Clear all boxes", key="f_clear", on_click=clear_build)
 
     feats, fmode = C.parse_bullets(feat_raw, maxb)
     if C.is_paragraph(feat_raw):
-        feats = [f.split(": ", 1)[-1] for f in feats]
+        feats = [x.split(": ", 1)[-1] for x in feats]
         st.caption(f"Paragraph detected and split into {len(feats)} feature points.")
 
     if C.ws(brand) and C.ws(ptype):
-        facts = C.Facts(brand=brand, product_type=ptype, attr1=a1, attr2=a2, size=size,
-                        use_case=use, features=feats)
-        title = C.build_title(facts, media)
-        high = C.build_highlights(facts, title)
-        bullets = C.build_bullets(facts, maxb)
+        facts = C.Facts(brand=brand, product_type=ptype, attr1=a1, attr2=a2, attr3=a3, attr4=a4,
+                        usp=usp, size_gender=size, use_case=use, features=feats)
+        res = C.compose(facts, media, max_bullets=maxb)
+        title, high, bullets = res["title"], res["highlights"], res["bullets"]
 
         au = [C.audit_title(title, brand, media), C.audit_highlights(high)]
         au += [C.audit_bullet(b, i + 1) for i, b in enumerate(bullets)]
@@ -171,12 +239,36 @@ with tabs[0]:
 
         st.markdown("---")
         scorecard(au)
+
+        h1, h2 = st.columns(2)
+        with h1:
+            st.markdown("**Moved down to Item Highlights**")
+            st.markdown("".join(f'<span class="chip ok">{C.esc(x)}</span>'
+                                for x in res["to_highlights"]) or "_nothing, it all fit the title_",
+                        unsafe_allow_html=True)
+        with h2:
+            st.markdown("**Moved down to the bullets**")
+            st.markdown("".join(f'<span class="chip warn">{C.esc(x)}</span>'
+                                for x in res["to_bullets"]) or "_nothing left over_",
+                        unsafe_allow_html=True)
+
+        problems = {k: v for k, v in res["logic"].items() if v}
+        if problems:
+            for num, msgs in problems.items():
+                for m in msgs:
+                    st.markdown(f'<div class="iss error"><b>Bullet {num}</b> &nbsp;{C.esc(m)}</div>',
+                                unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="iss ok"><b>Checked</b> &nbsp;Every bullet has one heading, no '
+                        'repeated clause, and no clause opening or closing on a conjunction.</div>',
+                        unsafe_allow_html=True)
+
         copy_out(title, high, bullets, key="b")
         st.session_state["listing"] = {"title": title, "high": high, "bullets": bullets,
                                        "brand": brand, "features": feats}
         with st.expander("Field-by-field check"):
             for a in au:
-                label(a.field, a.count, a.limit, "bytes" if "term" in a.field.lower() else "characters")
+                label(a.field, a.count, a.limit)
                 issues(a)
     else:
         st.info("Enter a brand name and a product type to see the listing.")
@@ -232,10 +324,10 @@ with tabs[1]:
     if mined and C.ws(iraw):
         facts = C.Facts(brand=ibrand, product_type=mined["product_type"],
                         attr1=ia1 or (mined["features"][0] if mined["features"] else ""),
-                        attr2=ia2, size=isize or mined["pack"] or mined["size"],
+                        attr2=ia2, size_gender=isize or mined["pack"] or mined["size"],
                         features=mined["features"])
-        title = C.build_title(facts, media)
-        high = C.build_highlights(facts, title)
+        _res = C.compose(facts, media, max_bullets=maxb)
+        title, high = _res["title"], _res["highlights"]
 
         pasted, bmode = C.parse_bullets(ibul, maxb)
         if pasted:
