@@ -351,3 +351,165 @@ SLOT_PLAN = [
     (7,  "Angle grid",      "Every angle in one frame, for shoppers who will not swipe."),
     (8,  "What is included","Everything in the box, so expectations match delivery."),
 ]
+
+
+def spec_card(src, headline, accent, stat, stat_label, chips=None, size=CANVAS, bg=None):
+    """Big statistic left, product right, icon chips along the bottom.
+    Use for weight, capacity, dimensions — the numbers that stop returns."""
+    if bg is not None:
+        canvas = fit(to_rgb(bg), size, size).resize((size, size), Image.LANCZOS)
+        canvas = Image.alpha_composite(canvas.convert("RGBA"),
+                                       Image.new("RGBA", (size, size), (245, 246, 248, 165))).convert("RGB")
+    else:
+        canvas = gradient((size, size), (250, 250, 252), (219, 223, 229))
+    d = ImageDraw.Draw(canvas)
+    d.polygon([(0, 0), (int(size * .30), 0), (0, int(size * .30))], fill=BLACK)
+    d.polygon([(0, 0), (int(size * .17), 0), (0, int(size * .17))], fill=RED)
+
+    prod, bbox = cutout(src); prod = prod.crop(bbox)
+    prod = fit(prod, int(size * .55), int(size * .46))
+    pos = (size - prod.width - int(size * .06), int(size * .30))
+    canvas = shadow(canvas, prod, pos, blur=48, opacity=115)
+    canvas.paste(prod, pos, prod)
+
+    d = ImageDraw.Draw(canvas)
+    m = int(size * .055)
+    f1 = display(int(size * .062))
+    y = int(size * .10)
+    y = draw_lines(d, (m, y), wrap(d, headline.upper(), f1, size * .55), f1, BLACK)
+    if accent:
+        y = draw_lines(d, (m, y), wrap(d, accent.upper(), f1, size * .55), f1, RED)
+    red_rule(d, m, y + 12, int(size * .10), 9)
+
+    if stat:
+        fs = display(int(size * .14))
+        d.text((m, int(size * .42)), str(stat), font=fs, fill=BLACK)
+        w = d.textlength(str(stat), font=fs)
+        d.text((m + w + 12, int(size * .50)), stat_label or "", font=cond(int(size * .04)), fill=RED)
+
+    for i, (t, s2) in enumerate((chips or [])[:3]):
+        cw = (size - m * 2) // 3
+        x = m + i * cw
+        yy = int(size * .84)
+        d.rounded_rectangle([x, yy, x + cw - 18, yy + int(size * .10)], radius=14,
+                            fill=WHITE, outline=(214, 218, 224), width=3)
+        d.rectangle([x, yy, x + 10, yy + int(size * .10)], fill=RED)
+        d.text((x + 30, yy + int(size * .018)), t.upper(), font=cond(int(size * .028)), fill=BLACK)
+        if s2:
+            d.text((x + 30, yy + int(size * .058)), s2, font=body(int(size * .019)), fill=(90, 96, 106))
+    return canvas
+
+
+TEMPLATES = {
+    "Main — pure white":      "main",
+    "Hero benefit":           "hero",
+    "Feature callouts":       "callouts",
+    "Certification badges":   "badge",
+    "Spec or statistic":      "spec",
+    "Angle grid":             "grid",
+}
+
+
+def render(kind, src, cfg, extras=None, bg=None, size=CANVAS):
+    """One entry point the UI can call for any template."""
+    if kind == "main":
+        return main_image(src, size)
+    if kind == "hero":
+        return hero(src, cfg.get("headline", ""), cfg.get("accent", ""),
+                    cfg.get("subline", ""), size, bg=bg)
+    if kind == "callouts":
+        return callouts(src, cfg.get("items", []), cfg.get("headline", ""), size)
+    if kind == "badge":
+        return badge_card(src, cfg.get("headline", "Certified for"), cfg.get("accent", "safety"),
+                          cfg.get("items", []), size, bg=bg)
+    if kind == "spec":
+        return spec_card(src, cfg.get("headline", ""), cfg.get("accent", ""),
+                         cfg.get("stat", ""), cfg.get("stat_label", ""),
+                         cfg.get("items", []), size, bg=bg)
+    if kind == "grid":
+        return angle_grid([src] + list(extras or []), cfg.get("labels"),
+                          cfg.get("headline", "360 view"), cfg.get("accent", "every angle covered"),
+                          size)
+    return main_image(src, size)
+
+
+# ------------------------------------------------------------------ auto plan
+CERT_RE  = re.compile(r"certif|standard|dot\b|ece\b|astm|cpsc|iso\b|fmvss|tested|compliance", re.I)
+STAT_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*(kg|g|lb|lbs|oz|ml|l|litre|liter|cm|mm|inch|inches|hours?|hrs?)", re.I)
+USE_RE   = re.compile(r"\bfor\b|use|ride|commut|travel|touring|daily|everyday", re.I)
+
+
+def features_from_copy(title="", bullets=None, attributes=None):
+    """Pulls (heading, detail) pairs out of whatever copy is available."""
+    out, seen = [], set()
+    for b in (bullets or []):
+        b = re.sub(r"\s+", " ", str(b)).strip()
+        if not b: continue
+        head, _, body = b.partition(":")
+        if not body: head, body = "", b
+        detail = body.split(";")[0].strip()
+        head = (head or " ".join(detail.split()[:2])).strip().title()
+        k = head.lower()
+        if head and detail and k not in seen:
+            seen.add(k); out.append((head, detail))
+    for a in (attributes or []):
+        a = re.sub(r"\s+", " ", str(a)).strip()
+        if not a: continue
+        head, _, body = a.partition("|")
+        head, detail = head.strip().title(), (body.strip() or a.strip())
+        if head.lower() in seen: continue
+        seen.add(head.lower()); out.append((head, detail))
+    if not out and title:
+        for seg in re.split(r"\s*[|,]\s*", title):
+            seg = seg.strip()
+            if len(seg.split()) >= 2 and seg.lower() not in seen:
+                seen.add(seg.lower()); out.append((" ".join(seg.split()[:2]).title(), seg))
+    return out
+
+
+def plan_from_copy(title="", bullets=None, attributes=None, brand="",
+                   have_bg=False, n_extra=0, target=6):
+    """Decides the image set: which template goes in which slot, and what copy
+    each one carries. Strongest material first, per Amazon's slot conventions."""
+    feats = features_from_copy(title, bullets, attributes)
+    certs = [f for f in feats if CERT_RE.search(f[0] + " " + f[1])]
+    stats = [f for f in feats if STAT_RE.search(f[0] + " " + f[1])]
+    uses  = [f for f in feats if USE_RE.search(f[0] + " " + f[1])]
+    lead  = feats[0] if feats else ("Built for the ride", "")
+
+    plan = [{"kind": "main", "name": "Main — pure white", "cfg": {}}]
+
+    plan.append({"kind": "hero", "name": "Hero benefit", "use_bg": have_bg, "cfg": {
+        "headline": " ".join(lead[0].split()[:2]) or "Built for",
+        "accent": " ".join(lead[0].split()[2:]) or "the ride",
+        "subline": lead[1][:150]}})
+
+    if feats:
+        plan.append({"kind": "callouts", "name": "Feature callouts", "cfg": {
+            "headline": "Engineered in detail", "items": feats[:6]}})
+
+    if certs:
+        plan.append({"kind": "badge", "name": "Certification", "cfg": {
+            "headline": "Certified for", "accent": "safety",
+            "items": [(c[0], c[1][:44]) for c in certs[:4]]}})
+
+    if stats:
+        m = STAT_RE.search(stats[0][0] + " " + stats[0][1])
+        plan.append({"kind": "spec", "name": "Spec or statistic", "cfg": {
+            "headline": stats[0][0], "accent": "", "stat": m.group(1),
+            "stat_label": m.group(2), "items": [(f[0], f[1][:36]) for f in feats[1:4]]}})
+
+    if have_bg:
+        u = uses[0] if uses else lead
+        plan.append({"kind": "hero", "name": "Lifestyle in use", "use_bg": True, "cfg": {
+            "headline": "Ready for", "accent": "any road", "subline": u[1][:150]}})
+
+    if n_extra:
+        plan.append({"kind": "grid", "name": "Angle grid", "cfg": {
+            "headline": "360 view", "accent": "every angle covered"}})
+
+    if len(plan) < target and len(feats) > 3:
+        plan.append({"kind": "callouts", "name": "More features", "cfg": {
+            "headline": "More to know", "items": feats[3:9]}})
+
+    return plan[:max(5, min(target, 9))]
