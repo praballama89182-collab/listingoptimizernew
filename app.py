@@ -6,6 +6,8 @@ import json, re, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import core as C
+import images as IMG
+from PIL import Image
 
 st.set_page_config(page_title="Listing Studio", page_icon="🛍️", layout="wide")
 
@@ -108,7 +110,8 @@ with st.sidebar:
     st.caption("**Field limits**  \nTitle 75 · Highlights 125 · Bullets 150–200 each, "
                "1000 total · Search terms 249 bytes")
 
-tabs = st.tabs(["Build a listing", "Improve a listing", "Keyword research", "Rules"])
+tabs = st.tabs(["Build a listing", "Improve a listing", "Listing images",
+                "Keyword research", "Rules"])
 
 # ================================================================ BUILD
 with tabs[0]:
@@ -315,7 +318,7 @@ def fetch(seed, source, mid, expand):
     rows.sort(key=lambda r: (-r["score"], r["rank"]))
     return rows, ""
 
-with tabs[2]:
+with tabs[3]:
     st.markdown("### Find keywords")
     k1, k2, k3 = st.columns([2, 1, 1])
     with k1:
@@ -425,7 +428,7 @@ with tabs[2]:
                        "ignores the entire field.")
 
 # ================================================================ RULES
-with tabs[3]:
+with tabs[4]:
     st.markdown("### The rules this tool enforces")
     st.markdown(f"""
 **Title — {C.TITLE_LIMIT} characters**
@@ -455,3 +458,119 @@ the limit causes Amazon to ignore every term in the field.
     st.caption("Reflects Amazon's title update of 27 July 2026 and the current Seller Central "
                "style guidance. Some categories, notably Pet Supplies and Apparel, cap titles "
                "shorter than the global limit — confirm yours in Seller Central.")
+
+# ================================================================ IMAGES
+with tabs[2]:
+    st.markdown("### Listing images")
+    st.caption("Upload your product photo and the gallery is built around it — main image on pure "
+               "white, then the infographic slots. Everything is 2000 x 2000 sRGB JPEG with "
+               "Amazon's file names.")
+
+    with st.expander("What an SEO-friendly image set needs", expanded=False):
+        for slot, name, why in IMG.SLOT_PLAN:
+            tag = "MAIN" if slot == 0 else f"PT{slot:02d}"
+            st.markdown(f"**{tag} — {name}.** {why}")
+        st.caption("Amazon recommends at least six images plus a video. Most listings allow nine, "
+                   "and seven show by default on desktop.")
+
+    up = st.file_uploader("Product photo on a plain background", type=["jpg", "jpeg", "png", "webp"],
+                          key="img_main")
+    extra = st.file_uploader("More angles, optional — used for the grid",
+                             type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
+                             key="img_extra")
+    lifestyle_bg = st.file_uploader("Lifestyle background photo, optional",
+                                    type=["jpg", "jpeg", "png", "webp"], key="img_bg")
+    st.caption("The tool composites your product and lays out the type. It does not invent "
+               "photographic scenery, so a lifestyle shot needs a background photo from you.")
+
+    L = st.session_state.get("listing", {})
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown('<div class="lbl"><b>ASIN or SKU for the file names</b></div>', unsafe_allow_html=True)
+        asin = st.text_input("as", key="img_asin", label_visibility="collapsed", placeholder="B0XXXXXXXX")
+        st.markdown('<div class="lbl"><b>Headline</b></div>', unsafe_allow_html=True)
+        hl = st.text_input("hl", key="img_hl", label_visibility="collapsed", placeholder="Ready for")
+        st.markdown('<div class="lbl"><b>Headline accent, shown in red</b></div>', unsafe_allow_html=True)
+        acc = st.text_input("ac", key="img_ac", label_visibility="collapsed", placeholder="any road")
+    with g2:
+        st.markdown('<div class="lbl"><b>Sub-line</b></div>', unsafe_allow_html=True)
+        sub = st.text_area("sb", key="img_sb", height=76, label_visibility="collapsed",
+                           placeholder="Real carbon fibre keeps weight down and cuts neck fatigue")
+        st.markdown('<div class="lbl"><b>Certifications — one per line, "name | detail"</b></div>',
+                    unsafe_allow_html=True)
+        certs = st.text_area("cf", key="img_cf", height=76, label_visibility="collapsed",
+                             placeholder="D.O.T. FMVSS 218 | Certified\nECE 22R06 | Certified")
+
+    default_feats = "\n".join(
+        f'{b.split(":")[0].title()} | {b.split(": ",1)[-1].split(";")[0]}'
+        for b in (L.get("bullets") or [])[:6]) if L.get("bullets") else ""
+    st.markdown('<div class="lbl"><b>Feature callouts — one per line, "title | description"</b></div>',
+                unsafe_allow_html=True)
+    feats_raw = st.text_area("fc", key="img_fc", height=130, label_visibility="collapsed",
+                             value=default_feats,
+                             placeholder="Aerodynamic design | Reduces wind resistance\n"
+                                         "Optimal airflow | Top and rear vents circulate air")
+    if L.get("bullets") and default_feats:
+        st.caption("Pre-filled from the listing you built. Edit freely.")
+
+    def split_pairs(txt, fallback=""):
+        out = []
+        for line in C.parse_lines(txt):
+            a, _, b = line.partition("|")
+            out.append((C.ws(a), C.ws(b) or fallback))
+        return out
+
+    if up is None:
+        st.info("Upload a product photo to build the gallery.")
+    else:
+        try:
+            src = Image.open(up)
+            others = [Image.open(f) for f in (extra or [])]
+            bg = Image.open(lifestyle_bg) if lifestyle_bg else None
+            built = []
+
+            with st.spinner("Building the gallery…"):
+                built.append(("Main — pure white", IMG.main_image(src), True))
+                if C.ws(hl) or C.ws(acc):
+                    built.append(("Hero benefit", IMG.hero(src, hl or "Built for", acc or "the ride",
+                                                           sub), False))
+                fpairs = split_pairs(feats_raw)
+                if fpairs:
+                    built.append(("Feature callouts",
+                                  IMG.callouts(others[0] if others else src, fpairs,
+                                               headline="Engineered in detail"), False))
+                cpairs = split_pairs(certs, "Certified")
+                if cpairs:
+                    built.append(("Certification", IMG.badge_card(src, "Certified for", "safety",
+                                                                  cpairs), False))
+                if bg is not None:
+                    built.append(("Lifestyle in use",
+                                  IMG.hero(src, hl or "Ready for", acc or "any road", sub, bg=bg), False))
+                if others:
+                    built.append(("Angle grid", IMG.angle_grid([src] + others), False))
+
+            st.markdown("---")
+            files = []
+            for i, (name, im, is_main) in enumerate(built):
+                data = IMG.encode(im)
+                fname = IMG.filename(asin, 0 if is_main else i)
+                files.append((fname, data))
+                st.markdown(f"#### {name}")
+                st.markdown(f'<div class="lbl"><b>{fname}</b>'
+                            f'<span class="ok">{im.size[0]} x {im.size[1]} · '
+                            f'{len(data)/1024:.0f} KB</span></div>', unsafe_allow_html=True)
+                st.image(im, use_container_width=True)
+                for sev, msg in IMG.audit_image(im, is_main=is_main):
+                    tag = {"error": "Fix", "warn": "Check", "ok": "OK"}[sev]
+                    st.markdown(f'<div class="iss {sev}"><b>{tag}</b> &nbsp;{C.esc(msg)}</div>',
+                                unsafe_allow_html=True)
+                st.download_button(f"Download {fname}", data, fname, "image/jpeg", key=f"dlimg{i}")
+
+            st.markdown("---")
+            st.download_button("Download the whole gallery (.zip)", IMG.build_zip(files),
+                               f"{IMG.safe_asin(asin)}_images.zip", "application/zip",
+                               type="primary", key="dlzip")
+            st.caption("Files are named to Amazon's convention — ASIN.MAIN.jpg then ASIN.PT01.jpg "
+                       "and so on, with no spaces or dashes.")
+        except Exception as e:
+            st.error(f"Could not process that image: {e}")
