@@ -5,3 +5,4 @@ streamlit>=1.36
 # if they're absent, so you can leave them commented out.
 # anthropic>=0.39
 # openai>=1.40
+pillow>=10.0
