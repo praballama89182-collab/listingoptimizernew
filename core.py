@@ -3,7 +3,7 @@ Listing Studio — core rules engine (no Streamlit).
 Amazon 2026 rules for title, item highlights, bullets and backend search terms.
 """
 from __future__ import annotations
-import html as _h, re
+import html as _h, re, unicodedata
 from dataclasses import dataclass, field
 
 # ----------------------------------------------------------------- limits
@@ -70,7 +70,18 @@ BULLET_MARK_RE = re.compile(r"^\s*(?:[\u2022\u2023\u25CF\u25AA\u00B7\-\*\u2013\u
 SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
 
 # ----------------------------------------------------------------- helpers
-def ws(s):  return WS_RE.sub(" ", (s or "").strip())
+def plain(s):
+    """Fold styled Unicode back to plain ASCII. Sellers paste bold or italic text
+    from formatting tools, but those are mathematical alphanumeric symbols, not
+    letters, and Amazon rejects them."""
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"') \
+         .replace("\u201d", '"').replace("\u2013", "-").replace("\u2014", "-") \
+         .replace("\u00a0", " ").replace("\u200b", "")
+    return s
+
+
+def ws(s):  return WS_RE.sub(" ", plain(s).strip())
 def n(s):   return ws(re.sub(r"[^a-z0-9 ]", " ", (s or "").lower()))
 def nkw(s): return ws(re.sub(r"[^\w\s]", " ", (s or "").lower(), flags=re.UNICODE))
 def clen(s):return len(s or "")
@@ -295,11 +306,26 @@ def score(audits):
 class Facts:
     brand: str = ""
     product_type: str = ""
-    attr1: str = ""          # material / line / model — sits before the product type
-    attr2: str = ""          # colour / style / core differentiator
-    size: str = ""           # size, capacity or pack count
-    features: list = field(default_factory=list)   # extra phrases from the raw title
+    attr1: str = ""          # strongest qualifier, sits before the product type
+    attr2: str = ""
+    attr3: str = ""
+    attr4: str = ""
+    usp: str = ""            # the single differentiator worth title space
+    size_gender: str = ""    # size, capacity, pack count or gender
+    features: list = field(default_factory=list)
     use_case: str = ""
+
+    # kept so older calls still work
+    @property
+    def size(self): return self.size_gender
+
+    def ordered(self):
+        """Content in the order it competes for space: title, then highlights,
+        then bullets."""
+        return [("brand", self.brand), ("attr1", self.attr1),
+                ("product_type", self.product_type), ("usp", self.usp),
+                ("size_gender", self.size_gender), ("attr2", self.attr2),
+                ("attr3", self.attr3), ("attr4", self.attr4)]
 
 # ================================================================= TITLE
 def fix_title(t, brand="", media=False):
@@ -338,55 +364,67 @@ def brand_first(title, brand):
     return ws(f"{brand} {rest}") if rest else brand
 
 def build_title(f: Facts, media=False):
-    """[Brand] + [Attribute 1] + [Product Type], [Attribute 2], [Size].
-    Size is reserved first; 'for' and 'with' are dropped; units abbreviated."""
+    """[Brand] + [Attribute 1] + [Product Type] + [USP], [Size or Gender].
+    Returns the title only; use compose() to get what did not fit."""
+    return compose(f, media)["title"]
+
+
+def _title_pass(f: Facts, media=False):
     lim = TITLE_LIMIT_MEDIA if media else TITLE_LIMIT
-    size = abbreviate_units(ws(f.size))
-    tail_bits = [x for x in [ws(f.attr2), size] if x]
-    tail = ", " + ", ".join(tail_bits) if tail_bits else ""
+    size = abbreviate_units(ws(f.size_gender))
+    tail = f", {size}" if size else ""
     budget = max(0, lim - clen(tail))
 
-    head = ""
-    for tok in [ws(f.brand), drop_filler(ws(f.attr1)), drop_filler(ws(f.product_type))]:
-        if not tok: continue
-        cand = ws(f"{head} {tok}") if head else tok
-        if clen(cand) <= budget: head = cand
+    head, used = "", set()
+    for key, val in [("brand", f.brand), ("attr1", f.attr1),
+                     ("product_type", f.product_type), ("usp", f.usp)]:
+        v = drop_filler(ws(val)) if key in ("attr1", "product_type", "usp") else ws(val)
+        if not v: continue
+        cand = ws(f"{head} {v}") if head else v
+        if clen(cand) <= budget and n(v) not in n(head):
+            head, _ = cand, used.add(key)
+    if size: used.add("size_gender")
     title = ws(head + tail) if head else ws(tail.lstrip(", "))
     title = brand_first(title, f.brand)
-    return fix_title(title, f.brand, media)[0]
+    return fix_title(title, f.brand, media)[0], used
+
 
 # ================================================================= HIGHLIGHTS
 def build_highlights(f: Facts, title, extra=None):
-    """[Primary material or spec]; [core differentiator or use case], <=125 chars.
-    The spec side deliberately restates the material even when it is in the title,
-    matching Amazon's own published examples. The use side carries everything new."""
-    used = set(n(title).split())
-    specs = [x for x in [ws(f.attr1), abbreviate_units(ws(f.size))] if x]
+    return compose(f, extra=extra)["highlights"]
+
+
+def _highlights_pass(f: Facts, title, used, extra=None):
+    """[spec]; [differentiator or use case], <=125. Fed by whatever the title
+    could not carry, in the same priority order."""
+    spec_side = [ws(f.attr1), abbreviate_units(ws(f.size_gender))]
     left, seen = "", set()
-    for sp in specs:
+    for sp in [x for x in spec_side if x]:
         k = n(sp)
         if not k or k in seen: continue
         cand = f"{left}, {sp}" if left else sp
         if clen(cand) <= HIGHLIGHT_LIMIT // 2:
             seen.add(k); left = cand
 
-    use_pool = [ws(f.use_case)] + [ws(x) for x in (f.features or [])] + \
-               [ws(f.attr2)] + list(extra or [])
-    right = ""
+    leftovers = [v for key, v in f.ordered() if key not in used and ws(v)]
+    use_pool = leftovers + [ws(f.usp), ws(f.use_case)] + \
+               [ws(x) for x in (f.features or [])] + list(extra or [])
+    right, placed = "", set()
     for u in use_pool:
         if not u: continue
         k = n(u)
         if not k or k in seen: continue
-        if all(w in used for w in k.split()) and n(u) in n(title): continue
         seen.add(k)
         cand = f"{right}, {u}" if right else u
         whole = f"{left}; {cand}" if left else cand
         if clen(whole) <= HIGHLIGHT_LIMIT:
-            right = cand
+            right = cand; placed.add(k)
 
     out = f"{left}; {right}" if (left and right) else (left or right)
     out = strip_conjunctions(tidy(no_emoji(no_html(out))))
-    return trim_to(out, HIGHLIGHT_LIMIT)[0]
+    out = trim_to(out, HIGHLIGHT_LIMIT)[0]
+    unplaced = [u for u in use_pool if ws(u) and n(u) not in placed and n(u) not in n(out)]
+    return out, unplaced
 
 
 # ================================================================= BULLETS
@@ -412,6 +450,11 @@ BENEFIT = {
 # rather than being truncated into the header.
 HEADER_MAP = [
  ("AIRFLOW",           r"vent|airflow|breathab|mesh|cool"),
+ ("SUN VISOR",         r"sun visor|sun shield|tint|glare|drop down"),
+ ("CLEAR VISOR",       r"clear visor|face shield|field of view|anti fog"),
+ ("CHIN BAR",          r"chin bar|chin guard|flip up|modular"),
+ ("CARBON SHELL",      r"carbon|fibre|fiber|composite|shell"),
+ ("LIGHTWEIGHT",       r"lightweight|light weight|\bkg\b|grams|neck fatigue|neck strain"),
  ("ADJUSTABLE FIT",    r"adjust|dial|strap|fit\b|sizing|circumference"),
  ("SAFETY CERTIFIED",  r"cpsc|astm|ce\b|certif|standard|tested|compliance"),
  ("IMPACT PROTECTION", r"impact|shell|abs|eps|absorb|protect"),
@@ -481,18 +524,41 @@ def benefit_for(text, used):
         if g not in used: return g
     return GENERIC[0]
 
+HEADER_RE = re.compile(r"^\s*([A-Za-z0-9][\w\s&/'\-]{2,40}?)\s*:\s*(.+)$", re.S)
+
+
+def split_header(text):
+    """Returns (existing_header, remainder). Sellers often write their own
+    'Superior Ventilation System: ...' lead, and that must become THE header
+    rather than getting a second one bolted in front of it."""
+    m = HEADER_RE.match(ws(text))
+    if not m: return "", ws(text)
+    head, rest = ws(m.group(1)), ws(m.group(2))
+    if len(head.split()) > 6 or not rest: return "", ws(text)
+    return head, rest
+
+
 def make_bullet(header, benefit, detail=""):
-    """[ALL CAPS HEADER]: [benefit-first statement]; [supporting feature detail]"""
-    header = ws(re.sub(r"[^\w\s\-]", "", header)).upper()[:34]
+    """[ALL CAPS HEADER]: [benefit-first statement]; [supporting detail].
+    Exactly one header and exactly one colon."""
+    inner, benefit = split_header(benefit)
+    if inner and not header:
+        header = inner
+    elif inner and header:
+        # the seller's own lead wins; the derived category header is dropped
+        header = inner
+    header = ws(re.sub(r"[^\w\s\-&/]", "", header)).upper()[:38]
     benefit = strip_conjunctions(ws(benefit))
     detail = strip_conjunctions(ws(detail))
     body = f"{benefit}; {detail}" if detail else benefit
     body = number_units(body)
-    body = re.sub(r"[.\s]+$", "", body)
+    # any further colon in the body would read as a second heading
+    body = body.replace(":", ";")
+    body = re.sub(r"\s*;\s*;+", "; ", body)
+    body = re.sub(r"[.\s;]+$", "", body)
     out = f"{header}: {body}" if header else body
     out = ws(no_html(no_emoji(strip_promo(out))))
-    out = re.sub(r"[.\s]+$", "", out)
-    return out
+    return re.sub(r"[.\s]+$", "", out)
 
 def pad_bullet(b, pool, used, target=BULLET_MIN, cap=BULLET_MAX, max_clauses=2):
     """Grow a bullet toward Amazon's 150-200 window. Capped so the first bullet
@@ -523,6 +589,10 @@ def build_bullets(f: Facts, max_bullets=MAX_BULLETS):
     if not rows and ws(f.product_type): rows.append(ws(f.product_type))
 
     used_h, used_b, used_d, out, seen = set(), set(), set(), [], set()
+    # reserve every heading phrase before the loop starts, otherwise an earlier
+    # bullet borrows a phrase that a later bullet needs to lead with
+    for r in rows[:max_bullets]:
+        if r != "__size__": used_d.add(r)
     for row in rows:
         if len(out) >= max_bullets: break
         header = short_header(row, used_h); used_h.add(header)
@@ -544,7 +614,7 @@ def build_bullets(f: Facts, max_bullets=MAX_BULLETS):
             hdr = b.split(":")[0]
             spare = HEADER_DETAIL.get(hdr, [])[:] + GENERIC + \
                     [d for d in feats + [ws(f.use_case), size_clause] if d and d not in used_d]
-            out[i] = pad_bullet(b, spare, used_d, target=BULLET_MIN, cap=BULLET_MAX, max_clauses=3)
+            out[i] = pad_bullet(b, spare, used_d, target=BULLET_MIN, cap=BULLET_MAX, max_clauses=4)
     return out
 
 
@@ -783,3 +853,82 @@ def force_into_bullets(bullets, keywords, pool=None, max_bullets=MAX_BULLETS):
             out.append(b); added.append(kw); placed = True
         if not placed: failed.append(kw)
     return out, already, added, failed
+
+
+# ================================================================= CASCADE
+def logic_issues(bullet):
+    """Grammar and sense checks run over every bullet before it is shown."""
+    out = []
+    b = ws(bullet)
+    if b.count(":") > 1:
+        out.append("More than one heading.")
+    head, body = (b.split(":", 1) + [""])[:2]
+    if not body.strip():
+        out.append("Heading with nothing after it.")
+        return out
+    clauses = [c.strip() for c in body.split(";") if c.strip()]
+    seen = set()
+    for c in clauses:
+        k = n(c)
+        if k in seen: out.append(f"Repeats the clause '{c[:34]}'.")
+        seen.add(k)
+        if n(c) and n(c) == n(head): out.append("A clause just repeats the heading.")
+        first = n(c).split()[0] if n(c).split() else ""
+        if first in CONJUNCTIONS: out.append(f"A clause opens on '{first}'.")
+        last = n(c).split()[-1] if n(c).split() else ""
+        if last in DANGLING_END: out.append(f"A clause ends on '{last}'.")
+        if len(n(c).split()) < 3: out.append(f"'{c[:24]}' is too short to be a clause.")
+    if re.search(r"\b(\w+)\s+\1\b", n(b)): out.append("A word is doubled.")
+    if b != b.strip() or "  " in b: out.append("Stray whitespace.")
+    return out
+
+
+def polish_bullet(b):
+    """Final clean-up so nothing ungrammatical reaches the output."""
+    b = ws(b)
+    head, sep, body = b.partition(":")
+    if not sep: head, body = "", b
+    # a detail clause may carry its own colon, which would read as a second
+    # heading, so everything after the first colon is demoted to a semicolon
+    body = body.replace(":", ";")
+    clauses, seen = [], set()
+    for c in body.split(";"):
+        c = strip_conjunctions(ws(c))
+        c = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", c, flags=re.I)   # doubled words
+        k = n(c)
+        if not c or k in seen or (head and k == n(head)) or len(k.split()) < 3:
+            continue
+        seen.add(k); clauses.append(c)
+    body = "; ".join(clauses)
+    out = f"{ws(head).upper()}: {body}" if head and body else (body or ws(head))
+    return re.sub(r"[.\s;]+$", "", ws(out))
+
+
+def compose(f: Facts, media=False, extra=None, max_bullets=MAX_BULLETS):
+    """Priority cascade. Content competes for the title first; what does not fit
+    drops to Item Highlights; what still does not fit becomes bullet material."""
+    title, used = _title_pass(f, media)
+    highlights, unplaced = _highlights_pass(f, title, used, extra)
+
+    merged, seen_f = [], set()
+    for x in list(f.features or []) + [u for u in unplaced if n(u) not in n(highlights)]:
+        k = n(x)
+        if k and k not in seen_f:
+            seen_f.add(k); merged.append(ws(x))
+    bullet_facts = Facts(brand=f.brand, product_type=f.product_type, attr1=f.attr1,
+                         attr2=f.attr2, attr3=f.attr3, attr4=f.attr4, usp=f.usp,
+                         size_gender=f.size_gender, use_case=f.use_case, features=merged)
+    bullets = [polish_bullet(b) for b in build_bullets(bullet_facts, max_bullets)]
+    bullets = [b for b in bullets if b]
+    # four strong bullets beat five with one padded out of filler
+    strong = [b for b in bullets if clen(b) >= 90]
+    if len(strong) >= 3:
+        bullets = strong
+
+    dropped_to_high = [v for k, v in f.ordered() if k not in used and ws(v)
+                       and n(v) in n(highlights)]
+    dropped_to_bul = [u for u in unplaced if n(u) not in n(highlights)]
+    return {"title": title, "highlights": highlights, "bullets": bullets,
+            "in_title": sorted(used), "to_highlights": dropped_to_high,
+            "to_bullets": dropped_to_bul,
+            "logic": {i + 1: logic_issues(b) for i, b in enumerate(bullets)}}
